@@ -152,70 +152,117 @@ class UncertaintyDisagreementFeatures:
 
 class GatingFeatureExtractor(nn.Module):
     """
-    Trích xuất và chuẩn hóa features cho gating network.
+    Trích xuất features cho gating network theo approach của GatingFeatureBuilder.
+    
+    Lightweight & scalable approach (không phụ thuộc vào số classes):
+    - Chỉ extract các statistics quan trọng từ posteriors
+    - Per-expert features: entropy, confidence, margin, disagreement metrics
+    - Global features: ensemble uncertainty, variance, agreement
     
     Input: expert posteriors [B, E, C]
-    Output: concatenated feature vector [B, D]
+    Output: concatenated feature vector [B, D] where D = 7*E + 3
     """
     
-    def __init__(self, num_experts: int, num_classes: int, normalize_features: bool = False):  # ← Changed default to False
+    def __init__(self, num_experts: int, num_classes: int, top_k: int = 5):
         super().__init__()
         self.num_experts = num_experts
         self.num_classes = num_classes
-        self.normalize_features = normalize_features
-        self.uncertainty_computer = UncertaintyDisagreementFeatures(num_experts)
+        self.top_k = top_k
         
-        # Tính output dimension
-        # Posteriors: E*C
-        # Per-expert: 3*E (entropy, confidence, margin)
-        # Global: 5 (disagreement_ratio, mean_kl, uniform_mixture_entropy, posterior_var, mutual_info)
-        self.feature_dim = (num_experts * num_classes +  # posteriors flattened
-                           3 * num_experts +              # per-expert features
-                           5)                             # global features
-        
-        # Optional: LayerNorm cho features (stable training)
-        if normalize_features:
-            self.feature_norm = nn.LayerNorm(self.feature_dim)
+        # Feature dimension: 7 per-expert + 3 global = 7*E + 3
+        self.feature_dim = 7 * num_experts + 3
     
+    @torch.no_grad()
     def forward(self, posteriors: torch.Tensor) -> torch.Tensor:
         """
+        Extract features from expert posteriors.
+        
         Args:
             posteriors: [B, E, C]
         
         Returns:
-            features: [B, D]
+            features: [B, 7*E + 3]
         """
         B, E, C = posteriors.shape
-        assert E == self.num_experts
-        assert C == self.num_classes
+        eps = 1e-8
         
-        # 1. Flatten posteriors
-        posteriors_flat = posteriors.reshape(B, -1)  # [B, E*C]
+        # ====================================================================
+        # PER-EXPERT FEATURES (7 features × E experts)
+        # ====================================================================
         
-        # 2. Compute uncertainty/disagreement features
-        unc_features = self.uncertainty_computer.compute(posteriors)
+        # 1. Entropy: H(p^(e)) = -Σ p(y|x) log p(y|x)
+        expert_entropy = -torch.sum(posteriors * torch.log(posteriors + eps), dim=-1)  # [B, E]
         
-        # 3. Concatenate all features
-        feature_list = [
-            posteriors_flat,                               # [B, E*C]
-            unc_features['expert_entropy'],               # [B, E]
-            unc_features['expert_confidence'],            # [B, E]
-            unc_features['expert_margin'],                # [B, E]
-            unc_features['disagreement_ratio'].unsqueeze(-1),  # [B, 1]
-            unc_features['mean_pairwise_kl'].unsqueeze(-1),    # [B, 1]
-            unc_features['uniform_mixture_entropy'].unsqueeze(-1),     # [B, 1]
-            unc_features['posterior_variance'].unsqueeze(-1),  # [B, 1]
-            unc_features['mutual_information'].unsqueeze(-1),  # [B, 1]
+        # 2. Top-K mass: concentration of probability mass
+        topk_vals, _ = torch.topk(posteriors, k=min(self.top_k, C), dim=-1)
+        topk_mass = torch.sum(topk_vals, dim=-1)  # [B, E]
+        residual_mass = 1.0 - topk_mass  # [B, E]
+        
+        # 3. Confidence metrics
+        max_probs, _ = posteriors.max(dim=-1)  # [B, E] - max probability (confidence)
+        
+        # Top1-Top2 gap (margin)
+        if topk_vals.size(-1) >= 2:
+            top1 = topk_vals[..., 0]
+            top2 = topk_vals[..., 1]
+            top_gap = top1 - top2  # [B, E]
+        else:
+            top_gap = torch.zeros_like(max_probs)
+        
+        # 4. Agreement metrics với mean posterior
+        mean_posterior = torch.mean(posteriors, dim=1, keepdim=True)  # [B, 1, C]
+        
+        # Cosine similarity: cos(p^(e), mean)
+        cosine_sim = F.cosine_similarity(posteriors, mean_posterior, dim=-1)  # [B, E]
+        
+        # KL divergence: KL(p^(e) || mean)
+        kl_to_mean = torch.sum(
+            posteriors * (torch.log(posteriors + eps) - torch.log(mean_posterior + eps)),
+            dim=-1
+        )  # [B, E]
+        
+        # ====================================================================
+        # GLOBAL FEATURES (3 features)
+        # ====================================================================
+        
+        # Mean entropy of ensemble
+        mean_posterior_flat = mean_posterior.squeeze(1)  # [B, C]
+        mean_entropy = -torch.sum(
+            mean_posterior_flat * torch.log(mean_posterior_flat + eps),
+            dim=-1
+        )  # [B]
+        
+        # Mean variance across classes (disagreement measure)
+        class_var = posteriors.var(dim=1)  # [B, C]
+        mean_class_var = class_var.mean(dim=-1)  # [B]
+        
+        # Std of max confidences (confidence dispersion between experts)
+        std_max_conf = max_probs.std(dim=-1)  # [B]
+        
+        # ====================================================================
+        # CONCATENATE ALL FEATURES
+        # ====================================================================
+        
+        # Per-expert features: [B, 7*E]
+        per_expert_feats = [
+            expert_entropy,      # [B, E]
+            topk_mass,           # [B, E]
+            residual_mass,       # [B, E]
+            max_probs,           # [B, E]
+            top_gap,             # [B, E]
+            cosine_sim,          # [B, E]
+            kl_to_mean           # [B, E]
         ]
+        per_expert_concat = torch.cat(per_expert_feats, dim=1)  # [B, 7*E]
         
-        features = torch.cat(feature_list, dim=-1)  # [B, D]
-        assert features.shape[1] == self.feature_dim
+        # Global features: [B, 3]
+        global_feats = torch.stack([mean_entropy, mean_class_var, std_max_conf], dim=1)
         
-        # Optional normalization with clipping for numerical stability
-        if self.normalize_features:
-            # Clip extreme values before LayerNorm to prevent NaN
-            features = torch.clamp(features, min=-100, max=100)
-            features = self.feature_norm(features)
+        # Final concatenation: [B, 7*E + 3]
+        features = torch.cat([per_expert_concat, global_feats], dim=1)
+        
+        # Clipping cho numerical stability
+        features = torch.clamp(features, min=-100, max=100)
         
         return features
 
