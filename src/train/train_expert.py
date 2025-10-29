@@ -21,11 +21,11 @@ EXPERT_CONFIGS = {
     'ce': {
         'name': 'ce_baseline',
         'loss_type': 'ce',
-        'epochs': 256,
+        'epochs': 200,  # Reduced from 256
         'lr': 0.1,
-        'weight_decay': 1e-4,
-        'dropout_rate': 0.1,  # No dropout for baseline
-        'milestones': [96, 192, 224],  # For MultiStepLR
+        'weight_decay': 5e-4,  # Increased from 1e-4
+        'dropout_rate': 0.0,  # No dropout for baseline
+        'milestones': [60, 120, 160],  # Adjusted for 200 epochs
         'gamma': 0.1
     },
     'logitadjust': {
@@ -291,7 +291,7 @@ def export_logits_for_all_splits(model, expert_name):
         torch.save(all_logits.to(torch.float16), output_dir / f"{split_name}_logits.pt")
         print(f"  Exported {split_name}: {len(indices):,} samples")
     
-    print(f"✅ All logits exported to: {output_dir}")
+    print(f"[SUCCESS] All logits exported to: {output_dir}")
 
 # --- CORE TRAINING FUNCTIONS ---
 
@@ -311,9 +311,9 @@ def train_single_expert(expert_key, use_expert_split=True):
     loss_type = expert_config['loss_type']
     
     print(f"\n{'='*60}")
-    print(f"🚀 TRAINING EXPERT: {expert_name.upper()}")
-    print(f"🎯 Loss Type: {loss_type.upper()}")
-    print(f"📁 Splits Dir: {CONFIG['dataset']['splits_dir']}")
+    print(f"[EXPERT] TRAINING EXPERT: {expert_name.upper()}")
+    print(f"[EXPERT] Loss Type: {loss_type.upper()}")
+    print(f"[EXPERT] Splits Dir: {CONFIG['dataset']['splits_dir']}")
     print(f"{'='*60}")
     
     # Setup
@@ -331,10 +331,10 @@ def train_single_expert(expert_key, use_expert_split=True):
     ).to(DEVICE)
     
     criterion = get_loss_function(loss_type, train_loader)
-    print(f"✅ Loss Function: {type(criterion).__name__}")
+    print(f"[SUCCESS] Loss Function: {type(criterion).__name__}")
     
     # Print model summary
-    print("📊 Model Architecture:")
+    print("[INFO] Model Architecture:")
     model.summary()
     
     # Optimizer and scheduler
@@ -353,7 +353,7 @@ def train_single_expert(expert_key, use_expert_split=True):
     
     # Load class weights for reweighted validation
     class_weights = load_class_weights(CONFIG['dataset']['splits_dir'])
-    print(f"✅ Loaded class weights for reweighted validation")
+    print(f"[SUCCESS] Loaded class weights for reweighted validation")
     
     # Training setup
     best_acc = 0.0
@@ -405,7 +405,7 @@ def train_single_expert(expert_key, use_expert_split=True):
     scaler = TemperatureScaler()
     optimal_temp = scaler.fit(model, val_loader, DEVICE)
     model.set_temperature(optimal_temp)
-    print(f"✅ Temperature calibration: T = {optimal_temp:.3f}")
+    print(f"[SUCCESS] Temperature calibration: T = {optimal_temp:.3f}")
     
     final_model_path = checkpoint_dir / f"final_calibrated_{expert_name}.pth"
     torch.save(model.state_dict(), final_model_path)
@@ -422,13 +422,13 @@ def train_single_expert(expert_key, use_expert_split=True):
     # Export logits
     export_logits_for_all_splits(model, expert_name)
     
-    print(f"✅ COMPLETED: {expert_name}")
+    print(f"[SUCCESS] COMPLETED: {expert_name}")
     return final_model_path
 
 
 def main():
     """Main training script - trains all 3 experts."""
-    print("🚀 AR-GSE Expert Training Pipeline")
+    print("[EXPERT] AR-GSE Expert Training Pipeline")
     print(f"Device: {DEVICE}")
     print(f"Dataset: {CONFIG['dataset']['name']}")
     print(f"Experts to train: {list(EXPERT_CONFIGS.keys())}")
@@ -440,16 +440,16 @@ def main():
             model_path = train_single_expert(expert_key)
             results[expert_key] = {'status': 'success', 'path': model_path}
         except Exception as e:
-            print(f"❌ Failed to train {expert_key}: {e}")
+            print(f"[ERROR] Failed to train {expert_key}: {e}")
             results[expert_key] = {'status': 'failed', 'error': str(e)}
             continue
     
     print(f"\n{'='*60}")
-    print("🏁 TRAINING SUMMARY")
+    print("[SUMMARY] TRAINING SUMMARY")
     print(f"{'='*60}")
     
     for expert_key, result in results.items():
-        status = "✅" if result['status'] == 'success' else "❌"
+        status = "[SUCCESS]" if result['status'] == 'success' else "[ERROR]"
         print(f"{status} {expert_key}: {result['status']}")
         if result['status'] == 'failed':
             print(f"    Error: {result['error']}")

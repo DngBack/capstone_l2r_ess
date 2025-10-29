@@ -1,0 +1,68 @@
+{
+  "splits": {
+    "val": {
+      "sanity": {
+        "shape": [
+          1000,
+          100
+        ],
+        "has_nan": false,
+        "has_inf": false,
+        "softmax_sum_mean": 1.0,
+        "softmax_sum_std": 7.382976718872669e-08
+      },
+      "metrics": {
+        "num_samples": 1000,
+        "accuracy": 0.3150000274181366,
+        "head_accuracy": 0.426086962223053,
+        "tail_accuracy": 0.06774193793535233,
+        "balanced_error": 0.7530855499207973,
+        "ece_15": 0.30505797266960144,
+        "nll": 3.4111828804016113,
+        "conf_mean": 0.6192370653152466,
+        "conf_std": 0.25771889090538025,
+        "entropy_mean": 1.3007254600524902,
+        "entropy_std": 0.8466442823410034
+      }
+    },
+    "test": {
+      "sanity": {
+        "shape": [
+          8000,
+          100
+        ],
+        "has_nan": false,
+        "has_inf": false,
+        "softmax_sum_mean": 1.0,
+        "softmax_sum_std": 8.993917788302497e-08
+      },
+      "metrics": {
+        "num_samples": 8000,
+        "accuracy": 0.3163750171661377,
+        "head_accuracy": 0.4320652186870575,
+        "tail_accuracy": 0.05887096747756004,
+        "balanced_error": 0.7545319069176912,
+        "ece_15": 0.30201318860054016,
+        "nll": 3.4157204627990723,
+        "conf_mean": 0.6183882355690002,
+        "conf_std": 0.25967201590538025,
+        "entropy_mean": 1.2938799858093262,
+        "entropy_std": 0.8574700355529785
+      }
+    },
+    "checkpoint": {
+      "path": "checkpoints\\experts\\cifar100_lt_if100\\ce_expert_best.pth",
+      "name": "ce_expert_best.pth",
+      "fingerprint": "7d4850de5b98",
+      "missing_keys": [
+        "temperature"
+      ],
+      "unexpected_keys": [],
+      "matched_key_count": 200,
+      "state_dict_key_count": 200,
+      "model_key_count": 201,
+      "loaded_param_count": 475253,
+      "total_param_count": 472757
+    }
+  }
+}

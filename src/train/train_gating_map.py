@@ -14,6 +14,7 @@ Usage:
 """
 
 import torch
+import torch.nn.functional as F
 import torch.optim as optim
 from torch.utils.data import DataLoader, TensorDataset
 import numpy as np
@@ -25,6 +26,70 @@ from typing import Dict, List, Tuple
 
 from src.models.gating_network_map import GatingNetwork, compute_uncertainty_for_map
 from src.models.gating_losses import GatingLoss, compute_gating_metrics
+
+
+# ============================================================================
+# IMPROVED LOSS FUNCTIONS
+# ============================================================================
+
+def compute_group_inverse_weights(labels: torch.Tensor, group_boundaries: List[int]) -> torch.Tensor:
+    """Compute inverse frequency weights per group (head/tail)."""
+    # Assign group for each sample
+    groups = torch.zeros_like(labels)
+    for i, boundary in enumerate(group_boundaries):
+        groups[labels >= boundary] = i + 1
+    
+    num_groups = len(group_boundaries) + 1
+    group_counts = torch.bincount(groups.long(), minlength=num_groups).float()
+    group_freqs = group_counts / group_counts.sum()
+    
+    # Inverse frequency weight
+    inv_freqs = 1.0 / (group_freqs + 1e-8)
+    sample_weights = inv_freqs[groups.long()]
+    sample_weights = sample_weights / sample_weights.mean()
+    
+    return sample_weights
+
+
+def compute_responsibility_loss(posteriors, weights, labels, temperature=1.0):
+    """Compute EM-style responsibility loss."""
+    B, E, C = posteriors.shape
+    expert_probs = posteriors[torch.arange(B), :, labels]  # [B, E]
+    
+    numerator = weights * expert_probs
+    responsibility = numerator / (numerator.sum(dim=1, keepdim=True) + 1e-8)
+    target_weights = F.softmax(responsibility / temperature, dim=1)
+    
+    kl = (target_weights * torch.log(target_weights / (weights + 1e-8))).sum(dim=1).mean()
+    return kl
+
+
+def estimate_group_priors(posteriors, labels, group_boundaries):
+    """Estimate which expert is best for each group."""
+    groups = torch.zeros_like(labels)
+    for i, boundary in enumerate(group_boundaries):
+        groups[labels >= boundary] = i + 1
+    
+    num_groups = len(group_boundaries) + 1
+    num_experts = posteriors.shape[1]
+    priors = torch.zeros(num_groups, num_experts)
+    
+    for g in range(num_groups):
+        mask = (groups == g)
+        if mask.sum() == 0:
+            priors[g] = 1.0 / num_experts
+            continue
+        
+        expert_preds = posteriors[mask].argmax(dim=-1)
+        labels_g = labels[mask]
+        
+        for e in range(num_experts):
+            acc = (expert_preds[:, e] == labels_g).float().mean()
+            priors[g, e] = acc
+        
+        priors[g] = F.softmax(priors[g] / 0.1, dim=0)
+    
+    return priors
 
 
 # ============================================================================
@@ -65,11 +130,20 @@ CONFIG = {
         # Loss weights
         'lambda_lb': 1e-2,     # load-balancing
         'lambda_h': 0.01,      # entropy regularization
+        'lambda_resp': 0.1,    # responsibility loss (EM-style)
+        'lambda_prior': 0.05,  # prior regularizer (group-aware)
         'use_load_balancing': True,
         'use_entropy_reg': True,
+        'use_responsibility': True,   # NEW: EM-style alignment
+        'use_prior_reg': True,        # NEW: Group prior regularizer
         
         # Long-tail handling
         'use_class_weights': True,  # reweight loss theo tần suất
+        'use_inverse_freq_weights': True,  # NEW: inverse freq per group
+        
+        # Router temperature annealing
+        'router_temp_start': 2.0,
+        'router_temp_end': 0.7,
         
         # Validation
         'val_interval': 5,
@@ -260,11 +334,14 @@ def train_one_epoch(
     train_loader: DataLoader,
     optimizer: optim.Optimizer,
     loss_fn: GatingLoss,
+    config: Dict,
+    epoch: int,
+    group_priors: torch.Tensor = None,
     sample_weights: torch.Tensor = None,
     grad_clip: float = 1.0
 ) -> Dict[str, float]:
     """
-    Train one epoch.
+    Train one epoch with improved losses.
     
     Returns:
         metrics: dict với các metrics trung bình
@@ -272,11 +349,18 @@ def train_one_epoch(
     model.train()
     
     total_loss = 0.0
-    loss_components = {'nll': 0.0, 'load_balancing': 0.0, 'entropy': 0.0}
+    loss_components = {'nll': 0.0, 'load_balancing': 0.0, 'entropy': 0.0, 
+                      'responsibility': 0.0, 'prior': 0.0}
     
     all_weights = []
     all_posteriors = []
     all_targets = []
+    
+    # Router temperature annealing
+    gating_config = config['gating']
+    router_temp = gating_config['router_temp_start'] - \
+                  (gating_config['router_temp_start'] - gating_config['router_temp_end']) * \
+                  (epoch / gating_config['epochs'])
     
     for batch_idx, (logits, targets) in enumerate(train_loader):
         # logits: [B, E, C], targets: [B]
@@ -289,7 +373,7 @@ def train_one_epoch(
         # Forward
         weights, aux = model(posteriors)  # [B, E]
         
-        # Compute loss
+        # Compute base loss (NLL + standard terms)
         batch_sample_weights = None
         if sample_weights is not None:
             batch_sample_weights = sample_weights[targets]
@@ -299,6 +383,26 @@ def train_one_epoch(
             sample_weights=batch_sample_weights,
             return_components=True
         )
+        
+        # Add responsibility loss (EM-style)
+        if gating_config.get('use_responsibility', False):
+            resp_loss = compute_responsibility_loss(posteriors, weights, targets, router_temp)
+            loss = loss + gating_config['lambda_resp'] * resp_loss
+            components['responsibility'] = resp_loss.item()
+        
+        # Add prior regularizer (group-aware)
+        if gating_config.get('use_prior_reg', False) and group_priors is not None:
+            # Compute mean weights per batch
+            mean_weights = weights.mean(dim=0)  # [E]
+            
+            # For each group, compute KL divergence
+            # Simplified: use uniform prior expectations
+            # In a real implementation, you'd compute per-group KL
+            target_prior = group_priors.mean(dim=0)  # Average across groups
+            prior_loss = (mean_weights * torch.log(mean_weights / (target_prior + 1e-8))).sum()
+            
+            loss = loss + gating_config['lambda_prior'] * prior_loss
+            components['prior'] = prior_loss.item()
         
         # Backward
         optimizer.zero_grad()
@@ -448,7 +552,7 @@ def train_gating(config: Dict):
     """Main training function."""
     
     print("="*70)
-    print("🚀 TRAINING GATING NETWORK FOR MAP")
+    print("TRAINING GATING NETWORK FOR MAP")
     print("="*70)
     
     # Setup
@@ -462,13 +566,13 @@ def train_gating(config: Dict):
     class_weights = None
     if config['gating']['use_class_weights']:
         class_weights = load_class_weights(config['dataset']['splits_dir'], DEVICE)
-        print(f"✅ Loaded class weights (range: [{class_weights.min():.4f}, {class_weights.max():.4f}])")
+        print(f"[OK] Loaded class weights (range: [{class_weights.min():.4f}, {class_weights.max():.4f}])")
     
     # Model
     num_experts = len(config['experts']['names'])
     num_classes = config['dataset']['num_classes']
     
-    print(f"\n📦 Creating GatingNetwork:")
+    print(f"\nCreating GatingNetwork:")
     print(f"   Experts: {num_experts}")
     print(f"   Classes: {num_classes}")
     print(f"   Routing: {config['gating']['routing']}")
@@ -490,14 +594,20 @@ def train_gating(config: Dict):
     
     # Loss
     use_lb = config['gating']['use_load_balancing'] and config['gating']['routing'] == 'top_k'
-    print(f"\n⚙️  Loss Configuration:")
+    print(f"\nLoss Configuration:")
     print(f"   Mixture NLL: ✓")
     print(f"   Load-balancing: {'✓' if use_lb else '✗ (disabled for dense routing)'}")
     print(f"   Entropy reg: {'✓' if config['gating']['use_entropy_reg'] else '✗'}")
+    print(f"   Responsibility loss: {'✓' if config['gating'].get('use_responsibility', False) else '✗'}")
+    print(f"   Prior regularizer: {'✓' if config['gating'].get('use_prior_reg', False) else '✗'}")
     if use_lb:
         print(f"   λ_LB: {config['gating']['lambda_lb']}")
     if config['gating']['use_entropy_reg']:
         print(f"   λ_H: {config['gating']['lambda_h']}")
+    if config['gating'].get('use_responsibility', False):
+        print(f"   λ_Resp: {config['gating']['lambda_resp']}")
+    if config['gating'].get('use_prior_reg', False):
+        print(f"   λ_Prior: {config['gating']['lambda_prior']}")
     
     loss_fn = GatingLoss(
         lambda_lb=config['gating']['lambda_lb'],
@@ -544,10 +654,31 @@ def train_gating(config: Dict):
     checkpoint_dir = Path(config['output']['checkpoints_dir']) / config['dataset']['name']
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
     
-    print(f"\n🏋️  Starting training for {config['gating']['epochs']} epochs...")
+    # Estimate group priors from training data
+    group_priors = None
+    if config['gating'].get('use_prior_reg', False):
+        print("\nEstimating group priors from training data...")
+        train_logits_list = []
+        train_labels_list = []
+        for logits, labels in train_loader:
+            posteriors = torch.softmax(logits.to(DEVICE), dim=-1)
+            train_logits_list.append(posteriors)
+            train_labels_list.append(labels.to(DEVICE))
+        
+        train_posteriors = torch.cat(train_logits_list, dim=0)
+        train_labels_full = torch.cat(train_labels_list, dim=0)
+        group_priors = estimate_group_priors(train_posteriors, train_labels_full, [69])
+        # Move to device
+        group_priors = group_priors.to(DEVICE)
+        print(f"   Group priors shape: {group_priors.shape}")
+        print(f"   Priors for each group:\n{group_priors}")
+    
+    print(f"\nStarting training for {config['gating']['epochs']} epochs...")
     print(f"   Batch size: {config['gating']['batch_size']}")
     print(f"   Learning rate: {config['gating']['lr']}")
     print(f"   Warmup epochs: {warmup_epochs}")
+    if config['gating'].get('use_responsibility', False):
+        print(f"   Router temp: {config['gating']['router_temp_start']:.1f} → {config['gating']['router_temp_end']:.1f}")
     
     for epoch in range(config['gating']['epochs']):
         # Warmup LR
@@ -559,6 +690,8 @@ def train_gating(config: Dict):
         # Train
         train_metrics = train_one_epoch(
             model, train_loader, optimizer, loss_fn,
+            config=config, epoch=epoch,
+            group_priors=group_priors,
             sample_weights=class_weights,
             grad_clip=1.0
         )
@@ -571,7 +704,12 @@ def train_gating(config: Dict):
         current_lr = optimizer.param_groups[0]['lr']
         print(f"\nEpoch {epoch+1:3d}/{config['gating']['epochs']}:")
         print(f"  Train Loss: {train_metrics['loss']:.4f} "
-              f"(NLL={train_metrics['nll']:.4f}), LR={current_lr:.6f}")
+              f"(NLL={train_metrics.get('nll', 0):.4f})")
+        if 'responsibility' in train_metrics and train_metrics['responsibility'] > 0:
+            print(f"    [Resp={train_metrics['responsibility']:.4f}]", end='')
+        if 'prior' in train_metrics and train_metrics['prior'] > 0:
+            print(f" [Prior={train_metrics['prior']:.4f}]", end='')
+        print(f" LR={current_lr:.6f}")
         print(f"  Mixture Acc: {train_metrics['mixture_acc']:.4f}, "
               f"Effective Experts: {train_metrics['effective_experts']:.2f}")
         
@@ -598,7 +736,7 @@ def train_gating(config: Dict):
                     'config': config
                 }, save_path)
                 
-                print(f"  💾 Saved best model (balanced_acc={best_balanced_acc:.4f})")
+                print(f"  Saved best model (balanced_acc={best_balanced_acc:.4f})")
             
             # Save history
             results_history.append({
@@ -631,7 +769,7 @@ def train_gating(config: Dict):
             history_serializable.append(serializable)
         json.dump(history_serializable, f, indent=2)
     
-    print(f"\n✅ Training completed!")
+    print(f"\nTraining completed!")
     print(f"   Best balanced acc: {best_balanced_acc:.4f}")
     print(f"   Best val loss: {best_val_loss:.4f}")
     print(f"   Checkpoints saved to: {checkpoint_dir}")

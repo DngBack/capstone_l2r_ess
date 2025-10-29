@@ -2,10 +2,10 @@
 Learning to Reject (LtR) Plugin - Pure Theory Implementation
 ==============================================================
 
-Implements the plug-in decision rule from LtR paper:
+Implements the plug-in decision rule from LtR paper (Theorem 1):
 
-1. Classifier: h_α(x) = argmax_y (α[y] · η̃[y])
-2. Rejector:  r(x) = 1{max_y(α[y]·η̃[y]) < ⟨μ, η̃⟩ - c}
+1. Classifier: h_α(x) = argmax_y (1/α[y] · η̃[y])
+2. Rejector:  r(x) = 1{max_y(1/α[y]·η̃[y]) < Σ_y'(1/α[y'] - μ[y'])·η̃[y'] - c}
 
 where:
 - η̃(x): mixture posterior from MoE [C]
@@ -18,7 +18,7 @@ Group-based simplification (for few samples):
 - μ[y] = μ_{grp(y)} for y in group g
 
 Reference: 
-    Learning to Reject Meets Long-tail Learning (OpenReview)
+    Learning to Reject Meets Long-tail Learning (ICLR 2024)
 """
 
 import torch
@@ -72,13 +72,13 @@ class LtRPlugin(nn.Module):
     """
     Pure LtR Plugin with group-based or class-based parameters.
     
-    Decision rules:
-        h_α(x) = argmax_y (α[y] · η̃[y])
-        r(x) = 1 if max_y(α[y]·η̃[y]) < ⟨μ, η̃⟩ - c
+    Decision rules (Paper Theorem 1):
+        h_α(x) = argmax_y (1/α[y] · η̃[y])
+        r(x) = 1 if max_y(1/α[y]·η̃[y]) < Σ_y'(1/α[y'] - μ[y'])·η̃[y'] - c
     
     Interpretation:
-    - α[y] > 1: boost confidence for class y (tail boosting)
-    - α[y] < 1: reduce confidence for class y (head penalty)
+    - α[y] > 1: reduce confidence for class y (head penalty)
+    - α[y] < 1: boost confidence for class y (tail boosting)
     - μ[y]: adjust threshold based on class distribution
     - c: global rejection cost (higher c = more rejection)
     """
@@ -159,7 +159,7 @@ class LtRPlugin(nn.Module):
     
     def predict_class(self, mixture_posterior: torch.Tensor) -> torch.Tensor:
         """
-        Classifier: h_α(x) = argmax_y (α[y] · η[y]) [Paper Formula]
+        Classifier: h_α(x) = argmax_y (1/α[y]) · η[y] [Paper Formula - Theorem 1]
         
         Args:
             mixture_posterior: [B, C] - p_y(x) from the paper
@@ -169,10 +169,10 @@ class LtRPlugin(nn.Module):
         """
         alpha = self.get_alpha()  # [C]
         
-        # CORRECT: weight by alpha (not divide)
+        # CORRECT: Paper uses 1/α, not α
         # Use small epsilon to avoid numerical issues
         eps = 1e-12
-        reweighted = mixture_posterior * alpha.unsqueeze(0).clamp(min=eps)  # [B, C]
+        reweighted = mixture_posterior / alpha.unsqueeze(0).clamp(min=eps)  # [B, C]
         
         # Argmax
         predictions = reweighted.argmax(dim=-1)  # [B]
@@ -185,7 +185,7 @@ class LtRPlugin(nn.Module):
         cost: Optional[float] = None
     ) -> torch.Tensor:
         """
-        Rejector: r(x) = 1{max_y(α[y]·η[y]) < ⟨μ, η⟩ - c} [Paper Formula]
+        Rejector: r(x) = 1{max_y(1/α[y]·η[y]) < Σ_y'(1/α[y'] - μ[y'])·η[y'] - c} [Paper Formula - Theorem 1]
         
         Args:
             mixture_posterior: [B, C] - p_y(x) from the paper
@@ -200,14 +200,14 @@ class LtRPlugin(nn.Module):
         if cost is None:
             cost = self.cost.item()
         
-        # Left side: max_y α[y] * p_y(x)
+        # Left side: max_y (1/α[y]) * p_y(x)
         eps = 1e-12
-        reweighted = mixture_posterior * alpha.unsqueeze(0).clamp(min=eps)  # [B, C]
+        reweighted = mixture_posterior / alpha.unsqueeze(0).clamp(min=eps)  # [B, C]
         max_reweighted = reweighted.max(dim=-1)[0]  # [B]
         
-        # Right side: ⟨α - μ, p(x)⟩ - c
-        # CORRECT: Use α - μ instead of 1/α - μ
-        threshold_coeff = (alpha - mu).unsqueeze(0)  # [1, C]
+        # Right side: Σ_y' (1/α[y'] - μ[y']) * p_y'(x) - c
+        # CORRECT: Use 1/α - μ as per paper Theorem 1
+        threshold_coeff = (1.0 / alpha.clamp(min=eps) - mu).unsqueeze(0)  # [1, C]
         threshold = (threshold_coeff * mixture_posterior).sum(dim=-1) - cost  # [B]
         
         # Rejection decision
@@ -244,11 +244,13 @@ class LtRPlugin(nn.Module):
         mu_tensor = self.get_mu()
         
         eps = 1e-12
-        reweighted = mixture_posterior * alpha_tensor.unsqueeze(0).clamp(min=eps)  # [B, C]
+        # CORRECT (Paper Theorem 1): use 1/α for both confidence and threshold terms
+        inv_alpha = (1.0 / alpha_tensor.clamp(min=eps))  # [C]
+        reweighted = mixture_posterior * inv_alpha.unsqueeze(0)  # [B, C]
         max_reweighted = reweighted.max(dim=-1)[0]  # [B]
         
-        # CORRECT: Use α - μ instead of 1/α - μ
-        threshold_coeff = (alpha_tensor - mu_tensor).unsqueeze(0)  # [1, C]
+        # Threshold base: Σ_y (1/α[y] - μ[y]) · p_y(x)
+        threshold_coeff = (inv_alpha - mu_tensor).unsqueeze(0)  # [1, C]
         threshold_base = (threshold_coeff * mixture_posterior).sum(dim=-1)  # [B]
         
         # For each sample, compute the cost threshold that would make it rejected
@@ -256,13 +258,12 @@ class LtRPlugin(nn.Module):
         # So cost = threshold_base - max_reweighted for rejected samples
         cost_thresholds = threshold_base - max_reweighted  # [B]
         
-        # Sort cost thresholds to find percentile
+        # Sort ascending: reject if t(x) > c. To get rejection rate r, choose c at (1 - r)-quantile
         sorted_costs = torch.sort(cost_thresholds)[0]
-        
-        # Find cost that achieves target rejection rate
-        target_idx = int(target_rejection_rate * len(sorted_costs))
-        target_idx = min(target_idx, len(sorted_costs) - 1)
-        
+        N = len(sorted_costs)
+        q = max(0.0, min(1.0, 1.0 - float(target_rejection_rate)))
+        # index for (1 - r)-quantile on ascending data
+        target_idx = int(round(q * (N - 1)))
         cost = sorted_costs[target_idx].item()
         
         return cost
@@ -287,9 +288,11 @@ class LtRPlugin(nn.Module):
         reject = self.predict_reject(mixture_posterior)
         
         # Additional info
-        reweighted = alpha.unsqueeze(0) * mixture_posterior
+        eps = 1e-12
+        reweighted = mixture_posterior / alpha.unsqueeze(0).clamp(min=eps)
         confidence = reweighted.max(dim=-1)[0]
-        threshold = (mu.unsqueeze(0) * mixture_posterior).sum(dim=-1) - self.cost.item()
+        threshold_coeff = (1.0 / alpha.clamp(min=eps) - mu).unsqueeze(0)
+        threshold = (threshold_coeff * mixture_posterior).sum(dim=-1) - self.cost.item()
         
         return {
             'predictions': predictions,
@@ -367,8 +370,8 @@ def compute_selective_metrics(
             mask_g = (groups == g)
             
             if mask_g.sum() == 0:
-                # No samples from this group
-                group_errors.append(0.0)
+                # No samples from this group - worst case error
+                group_errors.append(1.0)
             else:
                 errors_g = errors[mask_g]
                 weights_g = accept_weights[mask_g]
@@ -447,8 +450,9 @@ class LtRPowerIterOptimizer:
     def __init__(
         self,
         config: LtRPluginConfig,
-        num_iters: int = 10,
-        alpha_init_mode: str = 'prior'
+        num_iters: int = 20,
+        alpha_init_mode: str = 'prior',
+        damping: float = 0.0
     ):
         """
         Args:
@@ -459,6 +463,7 @@ class LtRPowerIterOptimizer:
         self.config = config
         self.num_iters = num_iters
         self.alpha_init_mode = alpha_init_mode
+        self.damping = damping
     
     def search(
         self,
@@ -467,7 +472,9 @@ class LtRPowerIterOptimizer:
         labels: torch.Tensor,
         sample_weights: Optional[torch.Tensor] = None,
         beta: Optional[torch.Tensor] = None,
-        verbose: bool = True
+        verbose: bool = True,
+        fixed_mu: Optional[np.ndarray] = None,
+        fixed_cost: Optional[float] = None
     ) -> OptimizationResult:
         """
         Power-iteration search following Algorithm 1.
@@ -484,7 +491,7 @@ class LtRPowerIterOptimizer:
             OptimizationResult with best (α, μ, c)
         """
         if verbose:
-            print(f"\n🔄 Power-Iteration Optimizer (Algorithm 1)")
+            print(f"\n[POWER-ITER] Power-Iteration Optimizer (Algorithm 1)")
             print(f"   Mode: {self.config.param_mode}")
             print(f"   Objective: {self.config.objective}")
             print(f"   Power-iter iterations: {self.num_iters}")
@@ -493,7 +500,13 @@ class LtRPowerIterOptimizer:
         best_objective = float('inf')
         
         # Generate search grid (only μ and c, α will be found by power-iter)
-        search_grid = self._generate_search_grid()
+        if fixed_mu is not None and fixed_cost is not None:
+            search_grid = [(fixed_mu, fixed_cost)]
+        elif fixed_mu is not None:
+            # Sweep costs from config, keep μ fixed
+            search_grid = [(fixed_mu, cost) for cost in self.config.cost_grid]
+        else:
+            search_grid = self._generate_search_grid()
         total_configs = len(search_grid)
         
         if verbose:
@@ -539,13 +552,36 @@ class LtRPowerIterOptimizer:
                     alpha_tensor_beta = alpha_tensor
                     # predictions and reject already computed above
                 
+                # Debug: Check rejection rate
+                rejection_rate = reject.float().mean().item()
+                if verbose and (idx == 0 or idx == len(search_grid) - 1):
+                    print(f"     Iter {m+1}: rejection_rate={rejection_rate:.3f}")
+                
                 # Then update based on empirical coverage
-                alpha = self._update_alpha_from_coverage(
+                alpha_new = self._update_alpha_from_coverage(
                     reject,
                     labels,
                     plugin.class_to_group,
                     sample_weights
                 )
+                
+                # Check convergence
+                alpha_diff = np.abs(alpha_new - alpha).max()
+                
+                if verbose and (idx == 0 or idx == len(search_grid) - 1):  # Only show for first and last config
+                    print(f"     Iter {m+1}: alpha={alpha} -> {alpha_new}, diff={alpha_diff:.4f}")
+                
+                # Update alpha for next iteration (with optional damping for stability)
+                if self.damping and self.damping > 0.0:
+                    alpha = (1.0 - self.damping) * alpha + self.damping * alpha_new
+                else:
+                    alpha = alpha_new
+                
+                # Early stopping if converged
+                if alpha_diff < 1e-4:
+                    if verbose and (idx == 0 or idx == len(search_grid) - 1):
+                        print(f"     Converged after {m+1} iterations")
+                    break
             
             # Evaluate final (h^(M), r^(M)) after M iterations
             # Set final α
@@ -556,11 +592,12 @@ class LtRPowerIterOptimizer:
                 predictions = plugin.predict_class(mixture_posterior)
                 reject = plugin.predict_reject(mixture_posterior)
             
+            # Paper metrics for balanced/worst should not use class reweighting
             metrics = compute_selective_metrics(
                 predictions, labels, reject,
                 plugin.class_to_group,
-                sample_weights,
-                beta
+                sample_weights=None,
+                beta=beta
             )
             
             # Compute objective value
@@ -592,12 +629,12 @@ class LtRPowerIterOptimizer:
             if verbose and (idx + 1) % max(1, total_configs // 10) == 0:
                 print(f"   Progress: {idx+1}/{total_configs} "
                       f"(best obj={best_objective:.4f}, "
-                      f"α={best_result.alpha if best_result else None})")
+                      f"alpha={best_result.alpha if best_result else None})")
         
         if verbose:
-            print(f"\n✅ Best configuration found:")
-            print(f"   α = {best_result.alpha} (found by power-iter)")
-            print(f"   μ = {best_result.mu}")
+            print(f"\n[SUCCESS] Best configuration found:")
+            print(f"   alpha = {best_result.alpha} (found by power-iter)")
+            print(f"   mu = {best_result.mu}")
             print(f"   c = {best_result.cost:.3f}")
             print(f"   Objective: {best_result.objective_value:.4f}")
             print(f"   Selective error: {best_result.selective_error:.4f}")
@@ -708,7 +745,7 @@ class LtRPowerIterOptimizer:
             accepted_in_group = group_mask & accept  # Samples in group g that are accepted
             
             if accepted_in_group.sum() > 0:
-                # α_k^(m+1) = K * (1/|S|) * Σ_{(x,y)∈S} 1{y ∈ G_k, r^(m+1)(x) = 0}
+                # α_k^(m+1) = K * P(y ∈ G_k, r^(m+1)(x) = 0)
                 # This is K times the proportion of ALL samples that are in group g AND accepted
                 empirical_coverage = accepted_in_group.sum().float().item() / len(labels)
                 alpha[g] = num_groups * empirical_coverage  # Multiply by K (num_groups)
@@ -729,22 +766,24 @@ class LtRPowerIterOptimizer:
     def _generate_search_grid(self) -> List[Tuple[np.ndarray, float]]:
         """
         Generate search grid over (μ, c) only.
-        
-        Paper: For K=2, can reduce μ to 1D (μ_tail - μ_head).
-        Here we use full 2D for simplicity.
-        
+
+        Paper Appendix E.1: For K=2, re-parameterize to a single
+        multiplier λ = μ_tail − μ_head. We can fix μ_head = 0 and
+        set μ_tail = λ without loss of generality, searching λ on a 1D grid.
+
         Returns:
             List of (mu, cost) tuples
         """
         grid = []
         
         if self.config.num_groups == 2:
-            # 2D search on (μ_head, μ_tail, c)
-            for mu_head in self.config.mu_grid:
-                for mu_tail in self.config.mu_grid:
-                    for cost in self.config.cost_grid:
-                        mu = np.array([mu_head, mu_tail])
-                        grid.append((mu, cost))
+            # 1D search on λ with μ = [0, λ]
+            # Preserve backward compatibility with existing mu_grid values
+            lambda_grid = self.config.mu_grid
+            for lam in lambda_grid:
+                for cost in self.config.cost_grid:
+                    mu = np.array([0.0, lam])
+                    grid.append((mu, cost))
         else:
             # General case
             raise NotImplementedError(f"Power-iter for {self.config.num_groups} groups not implemented")
@@ -861,9 +900,9 @@ class LtRGridSearchOptimizer:
                       f"(best obj={best_objective:.4f})")
         
         if verbose:
-            print(f"\n✅ Best configuration found:")
+            print(f"\n[SUCCESS] Best configuration found:")
             print(f"   α = {best_result.alpha}")
-            print(f"   μ = {best_result.mu}")
+            print(f"   mu = {best_result.mu}")
             print(f"   c = {best_result.cost:.3f}")
             print(f"   Objective: {best_result.objective_value:.4f}")
             print(f"   Selective error: {best_result.selective_error:.4f}")
@@ -964,6 +1003,7 @@ class RCCurveComputer:
         rejection_rates = []
         selective_errors = []
         group_errors_list = []
+        balanced_errors = []
         
         for cost in cost_grid:
             # Set cost
@@ -986,25 +1026,34 @@ class RCCurveComputer:
             rejection_rates.append(rejection_rate)
             selective_errors.append(metrics['selective_error'])
             group_errors_list.append(metrics['group_errors'])
+            # Balanced error per paper = mean of per-group errors
+            balanced_errors.append(float(np.mean(metrics['group_errors'])))
         
         # Convert to arrays
         rejection_rates = np.array(rejection_rates)
         selective_errors = np.array(selective_errors)
+        balanced_errors = np.array(balanced_errors)
         
         # CRITICAL: Sort by rejection rate (ascending) for correct AURC calculation
         # RC curve MUST go from low rejection (0) to high rejection (1)
         sort_idx = np.argsort(rejection_rates)
         rejection_rates = rejection_rates[sort_idx]
         selective_errors = selective_errors[sort_idx]
+        balanced_errors = balanced_errors[sort_idx]
         
         # Compute AURC (now with properly sorted data)
-        aurc = np.trapz(selective_errors, rejection_rates)
+        # For paper-compliant AURC on balanced error
+        aurc_balanced = np.trapz(balanced_errors, rejection_rates)
+        # Keep overall AURC as well for reference
+        aurc_overall = np.trapz(selective_errors, rejection_rates)
         
         return {
             'rejection_rates': rejection_rates,
             'selective_errors': selective_errors,
+            'balanced_errors': balanced_errors,
             'group_errors_list': group_errors_list,
-            'aurc': aurc,
+            'aurc': aurc_balanced,
+            'aurc_overall': aurc_overall,
             'cost_grid': cost_grid
         }
 
@@ -1176,7 +1225,7 @@ class LtRWorstGroupOptimizer:
         if verbose:
             print(f"\n✅ Best worst-group configuration:")
             print(f"   α = {best_result.alpha}")
-            print(f"   μ = {best_result.mu}")
+            print(f"   mu = {best_result.mu}")
             print(f"   c = {best_result.cost:.3f}")
             print(f"   Worst-group error: {best_result.worst_group_error:.4f}")
             print(f"   Group errors: {[f'{e:.4f}' for e in best_result.group_errors]}")

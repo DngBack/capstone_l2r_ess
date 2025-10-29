@@ -22,6 +22,10 @@ python train_ltr_plugin.py --objective balanced --optimizer power_iter --cost_sw
 
 # Step 4: Train LtR Plugin - Worst-group objective
 python train_ltr_plugin.py --objective worst --optimizer worst_group --cost_sweep
+
+# Alternative: Use standalone plugins (CE-only or Gating-based)
+python run_balanced_plugin_ce_only.py      # CE expert only
+python run_balanced_plugin_gating.py       # 3 experts + gating
 ```
 
 ---
@@ -71,17 +75,57 @@ Generate visualizations to validate the method:
 
 ```bash
 # Generate all analyses (routing, ensemble, calibration, ablation)
-python visualize_all.py
+python scripts/visualize_all.py
+
+# Or use other visualization scripts
+python scripts/visualize_gating_outputs.py
+python scripts/generate_comparison_plots.py
 ```
 
-**Outputs** (26 visualizations in `results/comprehensive_analysis/`):
+## 📁 Project Structure
 
+```
+├── src/                    # Main source code
+│   ├── data/              # Dataset utilities, splits, groups
+│   ├── models/            # Model definitions (experts, gating, plugins)
+│   ├── train/             # Training scripts
+│   ├── metrics/           # Metrics and evaluation
+│   └── visualize/         # Visualization utilities
+│
+├── scripts/                # Utility scripts
+│   ├── analysis/          # Analysis and test scripts
+│   └── archive/           # Old/duplicate files (for reference)
+│
+├── train_experts.py        # Main: Train 3 experts
+├── train_ltr_plugin.py     # Main: Train LtR plugin
+├── run_balanced_plugin_ce_only.py    # Standalone: CE-only plugin
+├── run_balanced_plugin_gating.py     # Standalone: Gating-based plugin
+├── run_paper_reproduction.py         # Paper reproduction pipeline
+└── quick_start.py          # Quick start helper
+```
+
+**Outputs** (40+ visualizations in `results/comprehensive_analysis/`):
+
+**Core Analysis:**
 - Routing patterns (9 subplots) - Load balance, expert usage, per-class routing
 - Expert disagreement (4 subplots) - Diversity analysis, pairwise agreement
 - Ensemble benefits (6 subplots) - Single vs mixture comparison
 - Calibration analysis (4 subplots) - ECE, Brier score, reliability diagrams
 - Ablation study (4 subplots) - Component importance, per-class improvements
+
+**Enhanced Analysis:**
+- Full-class analysis (12 subplots) - **ALL 100 classes** with head/tail breakdown
+- Softmax distribution (6 subplots) - Probability distributions, confidence, entropy
+- Expert contribution (15 subplots) - Contribution heatmaps, smoothing effect, per-sample analysis
+- **Per-sample analysis** (10 samples × 4 plots) - Expert posteriors, gating weights, mixture, summary
 - RC curves (3 plots) - Risk-coverage analysis from LtR plugin
+
+**Key Visualizations for Paper:**
+- `per_sample_analysis.png` - **10 samples**: Expert posteriors → Gating weights → Mixture distribution
+- `full_class_analysis.png` - Complete 100-class performance
+- `expert_contribution_detail.png` - Per-sample contribution breakdown
+- `softmax_contribution.png` - Distribution comparison
+- `mixture_smoothing_comparison.png` - Entropy/confidence analysis
 
 See [VISUALIZATION_GUIDE.md](./VISUALIZATION_GUIDE.md) for interpretation guide.
 
