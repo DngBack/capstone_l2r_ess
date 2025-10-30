@@ -63,7 +63,7 @@ class Config:
     eg_step: float = 1.0
 
     # Target rejection grid
-    target_rejections: List[float] = (0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8)
+    target_rejections: List[float] = (0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9)
 
     seed: int = 42
 
@@ -76,7 +76,9 @@ def ensure_dirs():
     Path(CFG.results_dir).mkdir(parents=True, exist_ok=True)
 
 
-def load_expert_logits(expert_names: List[str], split: str, device: str = DEVICE) -> torch.Tensor:
+def load_expert_logits(
+    expert_names: List[str], split: str, device: str = DEVICE
+) -> torch.Tensor:
     logits_list = []
     for expert_name in expert_names:
         path = Path(CFG.logits_dir) / expert_name / f"{split}_logits.pt"
@@ -96,12 +98,15 @@ def load_labels(split: str, device: str = DEVICE) -> torch.Tensor:
         if isinstance(t, torch.Tensor):
             return t.to(device=device, dtype=torch.long)
     import torchvision
+
     indices_file = Path(CFG.splits_dir) / f"{split}_indices.json"
     with open(indices_file, "r", encoding="utf-8") as f:
         indices = json.load(f)
     is_train = split in ("expert", "gating", "train")
     ds = torchvision.datasets.CIFAR100(root="./data", train=is_train, download=False)
-    return torch.tensor([ds.targets[i] for i in indices], dtype=torch.long, device=device)
+    return torch.tensor(
+        [ds.targets[i] for i in indices], dtype=torch.long, device=device
+    )
 
 
 def load_class_weights(device: str = DEVICE) -> torch.Tensor:
@@ -121,8 +126,11 @@ def load_class_weights(device: str = DEVICE) -> torch.Tensor:
 def load_gating_network(device: str = DEVICE):
     from src.models.gating_network_map import GatingNetwork, GatingMLP
     from src.models.gating import GatingFeatureBuilder
+
     num_experts = len(CFG.expert_names)
-    gating = GatingNetwork(num_experts=num_experts, num_classes=CFG.num_classes, routing="dense").to(device)
+    gating = GatingNetwork(
+        num_experts=num_experts, num_classes=CFG.num_classes, routing="dense"
+    ).to(device)
     # Rebuild MLP to match compact feature dimension from training (7*E + 3)
     compact_dim = 7 * num_experts + 3
     gating.mlp = GatingMLP(
@@ -130,7 +138,7 @@ def load_gating_network(device: str = DEVICE):
         num_experts=num_experts,
         hidden_dims=[256, 128],
         dropout=0.1,
-        activation='relu',
+        activation="relu",
     ).to(device)
     checkpoint_path = Path(CFG.gating_checkpoint)
     if not checkpoint_path.exists():
@@ -151,7 +159,9 @@ def load_gating_network(device: str = DEVICE):
 
 
 @torch.no_grad()
-def compute_mixture_posterior(expert_logits: torch.Tensor, gating_net, device: str = DEVICE) -> torch.Tensor:
+def compute_mixture_posterior(
+    expert_logits: torch.Tensor, gating_net, device: str = DEVICE
+) -> torch.Tensor:
     # expert_logits: [N, E, C]
     expert_posteriors = F.softmax(expert_logits, dim=-1)
     num_experts_logits = expert_logits.shape[1]
@@ -162,6 +172,7 @@ def compute_mixture_posterior(expert_logits: torch.Tensor, gating_net, device: s
         )
     # Build compact features and get weights via MLP + router
     from src.models.gating import GatingFeatureBuilder
+
     feat_builder = GatingFeatureBuilder()
     features = feat_builder(expert_logits)  # [N, 7*E+3]
     gating_logits = gating_net.mlp(features)
@@ -199,7 +210,9 @@ class GeneralizedLtRPlugin(nn.Module):
         num_groups = int(class_to_group.max().item() + 1)
         self.register_buffer("alpha_group", torch.ones(num_groups))
         self.register_buffer("mu_group", torch.zeros(num_groups))
-        self.register_buffer("beta_group", torch.ones(num_groups) / float(max(num_groups, 1)))
+        self.register_buffer(
+            "beta_group", torch.ones(num_groups) / float(max(num_groups, 1))
+        )
         self.register_buffer("cost", torch.tensor(0.0))
 
     def set_params(
@@ -216,7 +229,7 @@ class GeneralizedLtRPlugin(nn.Module):
 
     def _u_class(self) -> torch.Tensor:
         eps = 1e-12
-        u_group = (self.beta_group / self.alpha_group.clamp(min=eps))
+        u_group = self.beta_group / self.alpha_group.clamp(min=eps)
         return u_group[self.class_to_group]
 
     def _mu_class(self) -> torch.Tensor:
@@ -228,7 +241,9 @@ class GeneralizedLtRPlugin(nn.Module):
         return (posterior * u).argmax(dim=-1)
 
     @torch.no_grad()
-    def reject(self, posterior: torch.Tensor, cost: Optional[float] = None) -> torch.Tensor:
+    def reject(
+        self, posterior: torch.Tensor, cost: Optional[float] = None
+    ) -> torch.Tensor:
         u = self._u_class().unsqueeze(0)
         mu = self._mu_class().unsqueeze(0)
         max_reweighted = (posterior * u).max(dim=-1)[0]
@@ -278,7 +293,9 @@ def compute_metrics(
             group_errors.append(float(errors[mask].mean().item()))
         else:
             cw = class_weights[labels_a]
-            num = float((cw[mask] * (preds_a[mask] != labels_a[mask]).float()).sum().item())
+            num = float(
+                (cw[mask] * (preds_a[mask] != labels_a[mask]).float()).sum().item()
+            )
             den = float(cw[mask].sum().item())
             group_errors.append(num / max(den, 1e-12))
 
@@ -342,7 +359,7 @@ def compute_cost_for_target_rejection(
     alpha_t = torch.tensor(alpha, dtype=torch.float32, device=DEVICE)
     mu_t = torch.tensor(mu, dtype=torch.float32, device=DEVICE)
     beta_t = torch.tensor(beta, dtype=torch.float32, device=DEVICE)
-    u_group = (beta_t / alpha_t.clamp(min=1e-12))
+    u_group = beta_t / alpha_t.clamp(min=1e-12)
     u_class = u_group[class_to_group]
     mu_class = mu_t[class_to_group]
     max_rew = (posterior * u_class.unsqueeze(0)).max(dim=-1)[0]
@@ -367,9 +384,19 @@ def cs_plugin_inner(
     class_weights: Optional[torch.Tensor],
 ) -> Tuple[np.ndarray, np.ndarray, float, Dict[str, float]]:
     K = int(class_to_group.max().item() + 1)
-    best = {"obj": float("inf"), "alpha": None, "mu": None, "cost": None, "metrics": None}
+    best = {
+        "obj": float("inf"),
+        "alpha": None,
+        "mu": None,
+        "cost": None,
+        "metrics": None,
+    }
     for lam in CFG.mu_lambda_grid:
-        mu = np.array([0.0, float(lam)], dtype=np.float64) if K == 2 else np.zeros(K, dtype=np.float64)
+        mu = (
+            np.array([0.0, float(lam)], dtype=np.float64)
+            if K == 2
+            else np.zeros(K, dtype=np.float64)
+        )
         alpha = initialize_alpha(labels_s1, class_to_group)
         for _ in range(CFG.power_iter_iters):
             beta_t = torch.tensor(beta, dtype=torch.float32, device=DEVICE)
@@ -389,8 +416,12 @@ def cs_plugin_inner(
                 float(c_it),
             )
             rej = plugin.reject(posterior_s1)
-            alpha_new = update_alpha_from_coverage(rej, labels_s1, class_to_group, class_weights)
-            alpha = (1.0 - CFG.power_iter_damping) * alpha + CFG.power_iter_damping * alpha_new
+            alpha_new = update_alpha_from_coverage(
+                rej, labels_s1, class_to_group, class_weights
+            )
+            alpha = (
+                1.0 - CFG.power_iter_damping
+            ) * alpha + CFG.power_iter_damping * alpha_new
         c_s2 = compute_cost_for_target_rejection(
             posterior_s2, class_to_group, alpha, mu, beta, target_rej
         )
@@ -402,10 +433,18 @@ def cs_plugin_inner(
         )
         preds_s2 = plugin.predict(posterior_s2)
         rej_s2 = plugin.reject(posterior_s2)
-        m_s2 = compute_metrics(preds_s2, labels_s2, rej_s2, class_to_group, class_weights)
+        m_s2 = compute_metrics(
+            preds_s2, labels_s2, rej_s2, class_to_group, class_weights
+        )
         obj = float(np.sum(np.array(m_s2["group_errors"]) * np.array(beta)))
         if obj < best["obj"]:
-            best = {"obj": obj, "alpha": alpha.copy(), "mu": mu.copy(), "cost": float(c_s2), "metrics": m_s2}
+            best = {
+                "obj": obj,
+                "alpha": alpha.copy(),
+                "mu": mu.copy(),
+                "cost": float(c_s2),
+                "metrics": m_s2,
+            }
     # Local refinement around best μ (λ)
     if K == 2 and best["mu"] is not None:
         base_lam = float(best["mu"][1])
@@ -432,8 +471,12 @@ def cs_plugin_inner(
                         float(c_it),
                     )
                     rej = plugin.reject(posterior_s1)
-                    alpha_new = update_alpha_from_coverage(rej, labels_s1, class_to_group, class_weights)
-                    alpha = (1.0 - CFG.power_iter_damping) * alpha + CFG.power_iter_damping * alpha_new
+                    alpha_new = update_alpha_from_coverage(
+                        rej, labels_s1, class_to_group, class_weights
+                    )
+                    alpha = (
+                        1.0 - CFG.power_iter_damping
+                    ) * alpha + CFG.power_iter_damping * alpha_new
                 c_s2 = compute_cost_for_target_rejection(
                     posterior_s2, class_to_group, alpha, mu, beta, target_rej
                 )
@@ -445,18 +488,28 @@ def cs_plugin_inner(
                 )
                 preds_s2 = plugin.predict(posterior_s2)
                 rej_s2 = plugin.reject(posterior_s2)
-                m_s2 = compute_metrics(preds_s2, labels_s2, rej_s2, class_to_group, class_weights)
+                m_s2 = compute_metrics(
+                    preds_s2, labels_s2, rej_s2, class_to_group, class_weights
+                )
                 obj = float(np.sum(np.array(m_s2["group_errors"]) * np.array(beta)))
                 tried.append((lam, obj, alpha.copy(), mu.copy(), float(c_s2), m_s2))
             lam_b, obj_b, alpha_b, mu_b, c_b, m_b = min(tried, key=lambda x: x[1])
             if obj_b < best["obj"]:
-                best = {"obj": obj_b, "alpha": alpha_b, "mu": mu_b, "cost": c_b, "metrics": m_b}
+                best = {
+                    "obj": obj_b,
+                    "alpha": alpha_b,
+                    "mu": mu_b,
+                    "cost": c_b,
+                    "metrics": m_b,
+                }
                 base_lam = lam_b
             step *= 0.5
     return best["alpha"], best["mu"], best["cost"], best["metrics"]
 
 
-def plot_rc(r: np.ndarray, ew: np.ndarray, eb: np.ndarray, aw: float, ab: float, out_path: Path):
+def plot_rc(
+    r: np.ndarray, ew: np.ndarray, eb: np.ndarray, aw: float, ab: float, out_path: Path
+):
     plt.figure(figsize=(7, 5))
     plt.plot(r, ew, "o-", label=f"Worst-group (AURC={aw:.4f})", color="royalblue")
     plt.plot(r, eb, "s-", label=f"Balanced (AURC={ab:.4f})", color="green")
@@ -504,7 +557,15 @@ def main():
         cost_best = None
         for _ in range(CFG.eg_iters):
             alpha_t, mu_t, cost_t, metr_s2 = cs_plugin_inner(
-                plugin, post_s1, labels_s1, post_s2, labels_s2, class_to_group, beta, float(target_rej), class_weights
+                plugin,
+                post_s1,
+                labels_s1,
+                post_s2,
+                labels_s2,
+                class_to_group,
+                beta,
+                float(target_rej),
+                class_weights,
             )
             # EG update using group errors on S2
             e = np.array(metr_s2["group_errors"], dtype=np.float64)
@@ -514,7 +575,9 @@ def main():
             alpha_best, mu_best, cost_best = alpha_t, mu_t, cost_t
 
         # Evaluate on test using final params
-        c_test = compute_cost_for_target_rejection(post_test, class_to_group, alpha_best, mu_best, beta, float(target_rej))
+        c_test = compute_cost_for_target_rejection(
+            post_test, class_to_group, alpha_best, mu_best, beta, float(target_rej)
+        )
         plugin.set_params(
             torch.tensor(alpha_best, dtype=torch.float32, device=DEVICE),
             torch.tensor(mu_best, dtype=torch.float32, device=DEVICE),
@@ -523,20 +586,24 @@ def main():
         )
         preds_test = plugin.predict(post_test)
         rej_test = plugin.reject(post_test)
-        m_test = compute_metrics(preds_test, labels_test, rej_test, class_to_group, class_weights)
-        results.append({
-            "target_rejection": float(target_rej),
-            "beta": beta.tolist(),
-            "alpha": alpha_best.tolist(),
-            "mu": mu_best.tolist(),
-            "cost_test": float(c_test),
-            "test_metrics": {
-                "coverage": float(m_test["coverage"]),
-                "balanced_error": float(m_test["balanced_error"]),
-                "worst_group_error": float(m_test["worst_group_error"]),
-                "group_errors": [float(x) for x in m_test["group_errors"]],
-            },
-        })
+        m_test = compute_metrics(
+            preds_test, labels_test, rej_test, class_to_group, class_weights
+        )
+        results.append(
+            {
+                "target_rejection": float(target_rej),
+                "beta": beta.tolist(),
+                "alpha": alpha_best.tolist(),
+                "mu": mu_best.tolist(),
+                "cost_test": float(c_test),
+                "test_metrics": {
+                    "coverage": float(m_test["coverage"]),
+                    "balanced_error": float(m_test["balanced_error"]),
+                    "worst_group_error": float(m_test["worst_group_error"]),
+                    "group_errors": [float(x) for x in m_test["group_errors"]],
+                },
+            }
+        )
 
     r = np.array([1.0 - r_["test_metrics"]["coverage"] for r_ in results])
     ew = np.array([r_["test_metrics"]["worst_group_error"] for r_ in results])
@@ -552,25 +619,33 @@ def main():
         else:
             gap.append(float("nan"))
     gap = np.array(gap)[idx]
-    aurc_w = float(np.trapz(ew, r)) if r.size > 1 else float(ew.mean() if ew.size else 0.0)
-    aurc_b = float(np.trapz(eb, r)) if r.size > 1 else float(eb.mean() if eb.size else 0.0)
+    aurc_w = (
+        float(np.trapz(ew, r)) if r.size > 1 else float(ew.mean() if ew.size else 0.0)
+    )
+    aurc_b = (
+        float(np.trapz(eb, r)) if r.size > 1 else float(eb.mean() if eb.size else 0.0)
+    )
 
     out_json = Path(CFG.results_dir) / "ltr_plugin_gating_worst.json"
     with open(out_json, "w", encoding="utf-8") as f:
-        json.dump({
-            "description": "Worst-group plug-in via Algorithm 2 with inner CS plug-in (Algorithm 1). Mixture posterior from gating over 3 experts.",
-            "experts": CFG.expert_names,
-            "target_rejections": list(CFG.target_rejections),
-            "results_per_point": results,
-            "rc_curve": {
-                "rejection_rates": r.tolist(),
-                "worst_group_errors": ew.tolist(),
-                "balanced_errors": eb.tolist(),
-                "tail_minus_head": gap.tolist(),
-                "aurc_worst_group": aurc_w,
-                "aurc_balanced": aurc_b,
+        json.dump(
+            {
+                "description": "Worst-group plug-in via Algorithm 2 with inner CS plug-in (Algorithm 1). Mixture posterior from gating over 3 experts.",
+                "experts": CFG.expert_names,
+                "target_rejections": list(CFG.target_rejections),
+                "results_per_point": results,
+                "rc_curve": {
+                    "rejection_rates": r.tolist(),
+                    "worst_group_errors": ew.tolist(),
+                    "balanced_errors": eb.tolist(),
+                    "tail_minus_head": gap.tolist(),
+                    "aurc_worst_group": aurc_w,
+                    "aurc_balanced": aurc_b,
+                },
             },
-        }, f, indent=2)
+            f,
+            indent=2,
+        )
 
     plot_path = Path(CFG.results_dir) / "ltr_rc_curves_balanced_worst_gating_test.png"
     plot_rc(r, ew, eb, aurc_w, aurc_b, plot_path)
@@ -599,5 +674,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-
