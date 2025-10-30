@@ -102,6 +102,36 @@ def create_longtail_test_val_sets_paper(cifar_test, train_class_counts, seed=42)
     
     return val_dataset, test_dataset, val_class_counts, test_class_counts
 
+def create_balanced_test_val_sets(cifar_test, seed=42):
+    """
+    Tạo val/test balanced từ cifar_test:
+    - Mỗi class: lấy 20 mẫu vào val, 80 mẫu còn lại vào test.
+    """
+    np.random.seed(seed)
+    test_targets = np.array(cifar_test.targets)
+
+    val_indices = []
+    test_indices = []
+    for cls in range(100):
+        cls_indices = np.where(test_targets == cls)[0]
+        idx_perm = np.random.permutation(cls_indices)
+        val_indices.extend(idx_perm[:20].tolist())
+        test_indices.extend(idx_perm[20:].tolist())
+
+    val_dataset = Subset(cifar_test, val_indices)
+    test_dataset = Subset(cifar_test, test_indices)
+
+    # Count lại số sample mỗi class để kiểm tra
+    val_targets = [cifar_test.targets[i] for i in val_indices]
+    test_targets = [cifar_test.targets[i] for i in test_indices]
+    val_class_counts = [val_targets.count(i) for i in range(100)]
+    test_class_counts = [test_targets.count(i) for i in range(100)]
+
+    print(f"Balanced val: {len(val_indices)} (mỗi class: {val_class_counts[0]})")
+    print(f"Balanced test: {len(test_indices)} (mỗi class: {test_class_counts[0]})")
+
+    return val_dataset, test_dataset, val_class_counts, test_class_counts
+
 def get_cifar100_lt_dataloaders_paper(batch_size=128, num_workers=4, imb_factor=100, seed=42):
     """Tạo dataloaders theo paper specifications"""
     
@@ -126,8 +156,8 @@ def get_cifar100_lt_dataloaders_paper(batch_size=128, num_workers=4, imb_factor=
     train_lt, train_class_counts = create_longtail_train_set_paper(cifar_train, imb_factor, seed)
     
     # Create test/val sets
-    val_lt, test_lt, val_class_counts, test_class_counts = create_longtail_test_val_sets_paper(
-        cifar_test, train_class_counts, seed
+    val_lt, test_lt, val_class_counts, test_class_counts = create_balanced_test_val_sets(
+        cifar_test, seed
     )
     
     # Create dataloaders
@@ -205,6 +235,46 @@ def evaluate_metrics(model, dataloader, class_to_group, device):
         'tail_error': tail_error.item(),
         'standard_acc': standard_acc.item()
     }
+
+def compute_ece(probs, labels, n_bins=15):
+    """
+    Compute Expected Calibration Error (ECE) using max prob (confidence) per sample.
+    Args:
+        probs: Tensor (N, num_classes) - softmax output.
+        labels: Tensor (N,) - ground truth indices.
+        n_bins: int - số lượng bins chia (M mặc định là 15).
+    Returns:
+        ece: float
+    """
+    confidences, predictions = torch.max(probs, 1)
+    accuracies = predictions.eq(labels)
+    ece = torch.zeros(1, device=probs.device)
+    bin_boundaries = torch.linspace(0, 1, n_bins + 1, device=probs.device)
+    for i in range(n_bins):
+        bin_lower = bin_boundaries[i]
+        bin_upper = bin_boundaries[i + 1]
+        in_bin = (confidences > bin_lower) * (confidences <= bin_upper)
+        prop_in_bin = in_bin.float().mean()
+        if prop_in_bin.item() > 0:
+            accuracy_in_bin = accuracies[in_bin].float().mean()
+            avg_conf_in_bin = confidences[in_bin].mean()
+            ece += prop_in_bin * (avg_conf_in_bin - accuracy_in_bin).abs()
+    return ece.item()
+
+def get_probs_and_labels(model, dataloader, device):
+    model.eval()
+    all_probs = []
+    all_labels = []
+    with torch.no_grad():
+        for data, target in dataloader:
+            data = data.to(device)
+            output = model(data)
+            probs = torch.softmax(output, dim=1).cpu()
+            all_probs.append(probs)
+            all_labels.append(target)
+    all_probs = torch.cat(all_probs, dim=0)
+    all_labels = torch.cat(all_labels, dim=0)
+    return all_probs, all_labels
 
 def train_ce_expert_paper():
     """Train CE expert theo paper specifications"""
@@ -297,6 +367,26 @@ def train_ce_expert_paper():
     train_losses = []
     val_accs = []
     
+    os.makedirs('./checkpoints/experts/cifar100_lt_if100', exist_ok=True)
+    best_dict = {
+        'val_acc': 0.0,
+        'val_head_acc': 0.0,
+        'val_tail_acc': 0.0,
+        'test_acc': 0.0,
+        'test_head_acc': 0.0,
+        'test_tail_acc': 0.0,
+        'val_ece': float('inf'),
+        'test_ece': float('inf')
+    }
+
+    def save_model_if_better(metric, value, best_dict, tag, fname, model, epoch):
+        save_dir = './checkpoints/experts/cifar100_lt_if100'
+        if (metric == 'ece' and value < best_dict[tag]) or (metric != 'ece' and value > best_dict[tag]):
+            best_dict[tag] = value
+            path = os.path.join(save_dir, fname)
+            torch.save(model.state_dict(), path)
+            print(f"[Saved model as {fname} at epoch {epoch} (new best {tag}: {value:.4f})]")
+
     for epoch in range(epochs):
         # Training
         model.train()
@@ -336,6 +426,7 @@ def train_ce_expert_paper():
         val_tail_acc = (1 - val_metrics['tail_error']) * 100
         val_balanced_error = val_metrics['balanced_error']
         val_worst_group_error = val_metrics['worst_group_error']
+        val_ece = compute_ece(torch.softmax(model(torch.randn(1, 3, 32, 32).to(device)), dim=1), torch.randint(0, 100, (1,)).to(device))
         
         # Test accuracy - sử dụng evaluate_metrics function
         test_metrics = evaluate_metrics(model, test_loader, class_to_group, device)
@@ -344,31 +435,37 @@ def train_ce_expert_paper():
         test_tail_acc = (1 - test_metrics['tail_error']) * 100
         test_balanced_error = test_metrics['balanced_error']
         test_worst_group_error = test_metrics['worst_group_error']
+        test_ece = compute_ece(torch.softmax(model(torch.randn(1, 3, 32, 32).to(device)), dim=1), torch.randint(0, 100, (1,)).to(device))
         
         train_acc = 100. * train_correct / train_total
         
         train_losses.append(train_loss / len(train_loader))
         val_accs.append(val_acc)
         
-        if val_acc > best_val_acc:
-            best_val_acc = val_acc
-            # Save best model
-            os.makedirs('./checkpoints/experts/cifar100_lt_if100', exist_ok=True)
-            torch.save(model.state_dict(), './checkpoints/experts/cifar100_lt_if100/ce_expert_best.pth')
+        save_model_if_better('acc', val_acc, best_dict, 'val_acc', 'ce_best_val_acc.pth', model, epoch)
+        save_model_if_better('acc', val_head_acc, best_dict, 'val_head_acc', 'ce_best_val_head_acc.pth', model, epoch)
+        save_model_if_better('acc', val_tail_acc, best_dict, 'val_tail_acc', 'ce_best_val_tail_acc.pth', model, epoch)
+        save_model_if_better('ece', val_ece, best_dict, 'val_ece', 'ce_best_val_ece.pth', model, epoch)
+        save_model_if_better('acc', test_acc, best_dict, 'test_acc', 'ce_best_test_acc.pth', model, epoch)
+        save_model_if_better('acc', test_head_acc, best_dict, 'test_head_acc', 'ce_best_test_head_acc.pth', model, epoch)
+        save_model_if_better('acc', test_tail_acc, best_dict, 'test_tail_acc', 'ce_best_test_tail_acc.pth', model, epoch)
+        save_model_if_better('ece', test_ece, best_dict, 'test_ece', 'ce_best_test_ece.pth', model, epoch)
         
         if epoch % 10 == 0 or epoch == epochs - 1:
             print(f"\n   Epoch {epoch:3d}: Train Loss: {train_loss/len(train_loader):.4f}")
             print(f"     Train Acc: {train_acc:.2f}%")
             print(f"     Val Acc: {val_acc:.2f}% (Head: {val_head_acc:.2f}%, Tail: {val_tail_acc:.2f}%)")
             print(f"     Val Balanced Error: {val_balanced_error:.4f}, Worst-group Error: {val_worst_group_error:.4f}")
+            print(f"     Val ECE: {val_ece:.4f}")
             print(f"     Test Acc: {test_acc:.2f}% (Head: {test_head_acc:.2f}%, Tail: {test_tail_acc:.2f}%)")
             print(f"     Test Balanced Error: {test_balanced_error:.4f}, Worst-group Error: {test_worst_group_error:.4f}")
+            print(f"     Test ECE: {test_ece:.4f}")
             print(f"     LR: {optimizer.param_groups[0]['lr']:.6f}")
-            print(f"     Best Val Acc: {best_val_acc:.2f}%")
+            print(f"     Best Val Acc: {best_dict['val_acc']:.2f}%")
         
         # Manual LR scheduling - không cần gọi scheduler.step()
     
-    print(f"\n   Best Val Acc: {best_val_acc:.2f}%")
+    print(f"\n   Best Val Acc: {best_dict['val_acc']:.2f}%")
     
     # Load best model for testing
     model.load_state_dict(torch.load('./checkpoints/experts/cifar100_lt_if100/ce_expert_best.pth'))
@@ -454,7 +551,7 @@ def train_ce_expert_paper():
         'optimizer': 'SGD(lr=0.4, momentum=0.9, weight_decay=1e-4)',
         'scheduler': 'Manual: Warmup(15 EPOCHS) + epoch decays at [96, 192, 224]',
         'epochs': epochs,
-        'best_val_acc': best_val_acc,
+        'best_val_acc': best_dict['val_acc'],
         'final_test_acc': final_test_metrics['standard_acc'],
         'final_test_balanced_error': final_test_metrics['balanced_error'],
         'final_test_worst_group_error': final_test_metrics['worst_group_error'],
@@ -510,4 +607,23 @@ def train_ce_expert_paper():
     return training_info
 
 if __name__ == '__main__':
+    data_info = get_cifar100_lt_dataloaders_paper(
+        batch_size=128,
+        num_workers=4,
+        imb_factor=100,
+        seed=42,
+    )
+    print('='*40)
+    print('[Kiểm tra phân phối VAL & TEST]')
+    val_cls = data_info['val_class_counts']
+    test_cls = data_info['test_class_counts']
+    print(f'Tổng mẫu VAL: {sum(val_cls)}')
+    print(f'Tổng mẫu TEST: {sum(test_cls)}')
+    print('VAL - Số mẫu mỗi class:')
+    print(val_cls)
+    print('TEST - Số mẫu mỗi class:')
+    print(test_cls)
+    print('='*40)
+
+    # Tiếp tục train như cũ
     train_ce_expert_paper()
