@@ -119,9 +119,19 @@ def load_class_weights(device: str = DEVICE) -> torch.Tensor:
 
 
 def load_gating_network(device: str = DEVICE):
-    from src.models.gating_network_map import GatingNetwork
+    from src.models.gating_network_map import GatingNetwork, GatingMLP
+    from src.models.gating import GatingFeatureBuilder
     num_experts = len(CFG.expert_names)
     gating = GatingNetwork(num_experts=num_experts, num_classes=CFG.num_classes, routing="dense").to(device)
+    # Rebuild MLP to match compact feature dimension from training (7*E + 3)
+    compact_dim = 7 * num_experts + 3
+    gating.mlp = GatingMLP(
+        input_dim=compact_dim,
+        num_experts=num_experts,
+        hidden_dims=[256, 128],
+        dropout=0.1,
+        activation='relu',
+    ).to(device)
     checkpoint_path = Path(CFG.gating_checkpoint)
     if not checkpoint_path.exists():
         raise FileNotFoundError(f"Missing gating checkpoint: {checkpoint_path}")
@@ -150,11 +160,12 @@ def compute_mixture_posterior(expert_logits: torch.Tensor, gating_net, device: s
         raise ValueError(
             f"Mismatch: logits have {num_experts_logits} experts but config expects {num_experts_config} experts"
         )
-    gating_output = gating_net(expert_posteriors)
-    if isinstance(gating_output, tuple):
-        gating_weights = gating_output[0]  # [N, E]
-    else:
-        gating_weights = gating_output  # [N, E]
+    # Build compact features and get weights via MLP + router
+    from src.models.gating import GatingFeatureBuilder
+    feat_builder = GatingFeatureBuilder()
+    features = feat_builder(expert_logits)  # [N, 7*E+3]
+    gating_logits = gating_net.mlp(features)
+    gating_weights = gating_net.router(gating_logits)
     if torch.isnan(gating_weights).any():
         N, E = expert_logits.shape[0], expert_logits.shape[1]
         gating_weights = torch.ones(N, E, device=device) / E

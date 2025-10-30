@@ -174,7 +174,8 @@ def load_class_weights(device: str = DEVICE) -> torch.Tensor:
 
 def load_gating_network(device: str = DEVICE):  # Returns GatingNetwork
     """Load trained gating network."""
-    from src.models.gating_network_map import GatingNetwork
+    from src.models.gating_network_map import GatingNetwork, GatingMLP
+    from src.models.gating import GatingFeatureBuilder
 
     num_experts = len(CFG.expert_names)
     num_classes = CFG.num_classes
@@ -183,6 +184,16 @@ def load_gating_network(device: str = DEVICE):  # Returns GatingNetwork
 
     gating = GatingNetwork(
         num_experts=num_experts, num_classes=num_classes, routing="dense"
+    ).to(device)
+
+    # Match compact feature setup used during training (GatingFeatureBuilder: D = 7*E + 3)
+    compact_dim = 7 * num_experts + 3
+    gating.mlp = GatingMLP(
+        input_dim=compact_dim,
+        num_experts=num_experts,
+        hidden_dims=[256, 128],
+        dropout=0.1,
+        activation='relu',
     ).to(device)
 
     checkpoint_path = Path(CFG.gating_checkpoint)
@@ -221,8 +232,11 @@ def compute_mixture_posterior(
     """Compute mixture posterior using gating network."""
     # expert_logits: [N, E, C]
     with torch.no_grad():
-        # Convert logits to posteriors
+        # Convert logits to posteriors (for mixture) and build compact gating features
         expert_posteriors = F.softmax(expert_logits, dim=-1)  # [N, E, C]
+        from src.models.gating import GatingFeatureBuilder
+        feat_builder = GatingFeatureBuilder()
+        features = feat_builder(expert_logits)                # [N, 7*E+3]
 
         # Verify shape matches expected number of experts
         num_experts_logits = expert_logits.shape[1]
@@ -232,12 +246,9 @@ def compute_mixture_posterior(
                 f"Mismatch: logits have {num_experts_logits} experts but config expects {num_experts_config} experts"
             )
 
-        # Get gating weights
-        gating_output = gating_net(expert_posteriors)
-        if isinstance(gating_output, tuple):
-            gating_weights = gating_output[0]  # [N, E]
-        else:
-            gating_weights = gating_output  # [N, E]
+        # Get gating weights via mlp + router on compact features
+        gating_logits = gating_net.mlp(features)              # [N, E]
+        gating_weights = gating_net.router(gating_logits)     # [N, E]
 
         # Check for NaN
         if torch.isnan(gating_weights).any():
