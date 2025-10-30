@@ -3,7 +3,7 @@
 Standalone Balanced Plug-in with Gating (3 Experts) per "Learning to Reject Meets Long-Tail Learning"
 =======================================================================================================
 
-- Loads CIFAR-100-LT splits and 3 expert logits (CE, LogitAdjust, BalSoftmax)
+- Loads CIFAR-100-LT splits and 3 expert logits (CE, LogitAdjust, BalancedSoftmax)
 - Loads trained gating network to combine experts
 - Builds head/tail groups from train class counts (tail <= 20 samples)
 - Implements Theorem 1 decision rules (classifier and rejector)
@@ -15,7 +15,6 @@ Inputs (expected existing):
 - Splits dir: ./data/cifar100_lt_if100_splits_fixed/
 - Logits dir: ./outputs/logits/cifar100_lt_if100/{expert_name}/{split}_logits.pt
 - Gating checkpoint: ./checkpoints/gating_map/cifar100_lt_if100/final_gating.pth
-- Targets (if available): ./outputs/logits/cifar100_lt_if100/{expert_name}/{split}_targets.pt
 
 Outputs:
 - results/ltr_plugin/cifar100_lt_if100/ltr_plugin_gating_balanced.json
@@ -24,7 +23,7 @@ Outputs:
 
 import json
 from pathlib import Path
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
@@ -42,17 +41,13 @@ class Config:
     dataset_name: str = "cifar100_lt_if100"
     splits_dir: str = "./data/cifar100_lt_if100_splits_fixed"
     logits_dir: str = "./outputs/logits/cifar100_lt_if100"
+    results_dir: str = "./results/ltr_plugin/cifar100_lt_if100"
     gating_checkpoint: str = (
         "./checkpoints/gating_map/cifar100_lt_if100/final_gating.pth"
     )
-    results_dir: str = "./results/ltr_plugin/cifar100_lt_if100"
 
-    expert_names: List[str] = field(
-        default_factory=lambda: [
-            "ce_baseline",
-            "logitadjust_baseline",
-            "balsoftmax_baseline",
-        ]
+    expert_names: List[str] = (
+        None  # Will be set to ["ce_baseline", "logitadjust_baseline", "balsoftmax_baseline"]
     )
 
     num_classes: int = 100
@@ -88,8 +83,45 @@ class Config:
     seed: int = 42
 
 
-CFG = Config()
+# Initialize expert names
+def init_config():
+    cfg = Config()
+    if cfg.expert_names is None:
+        cfg.expert_names = [
+            "ce_baseline",
+            "logitadjust_baseline",
+            "balsoftmax_baseline",
+        ]
+    return cfg
+
+
+CFG = init_config()
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+
+
+# ================================
+# Load gating network
+# ================================
+
+
+def load_gating_network():
+    """Load the pre-trained gating network."""
+    from src.models.gating_network_map import GatingNetwork
+
+    print(f"Loading gating network from: {CFG.gating_checkpoint}")
+    checkpoint = torch.load(
+        CFG.gating_checkpoint, map_location=DEVICE, weights_only=False
+    )
+
+    gating = GatingNetwork(
+        num_experts=len(CFG.expert_names), num_classes=CFG.num_classes, routing="dense"
+    ).to(DEVICE)
+
+    gating.load_state_dict(checkpoint["model_state_dict"])
+    gating.eval()
+    print("✓ Gating network loaded successfully")
+
+    return gating
 
 
 # ================================
@@ -97,36 +129,67 @@ DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 # ================================
 
 
-def load_expert_logits(
-    expert_names: List[str], split: str, device: str = DEVICE
-) -> torch.Tensor:
-    """Load logits from all experts and stack them."""
+def load_expert_logits(split: str, device: str = DEVICE) -> torch.Tensor:
+    """Load and stack expert logits for a split."""
     logits_list = []
 
-    print(f"Loading logits for {len(expert_names)} experts: {expert_names}")
-    for expert_name in expert_names:
+    for expert_name in CFG.expert_names:
         path = Path(CFG.logits_dir) / expert_name / f"{split}_logits.pt"
         if not path.exists():
             raise FileNotFoundError(f"Missing logits: {path}")
-        logits = torch.load(path, map_location=device).float()
-        logits_list.append(logits)
-        print(f"  ✓ Loaded {expert_name}: {logits.shape}")
 
-    # Stack: [E, N, C] -> transpose to [N, E, C]
+        logits_e = torch.load(path, map_location=device).float()
+        logits_list.append(logits_e)
+        print(f"  Loaded {expert_name}: {logits_e.shape}")
+
+    # Stack: [E, N, C] → transpose → [N, E, C]
     logits = torch.stack(logits_list, dim=0).transpose(0, 1)
-    print(
-        f"✓ Stacked expert logits: {logits.shape} (should be [N, {len(expert_names)}, {CFG.num_classes}])"
-    )
+    print(f"✓ Stacked expert logits: {logits.shape}")
+
     return logits
+
+
+def compute_mixture_posterior(
+    logits: torch.Tensor, gating: nn.Module, device: str = DEVICE
+) -> torch.Tensor:
+    """
+    Compute mixture posterior using gating network.
+
+    Args:
+        logits: [N, E, C] tensor of expert logits
+        gating: GatingNetwork module
+
+    Returns:
+        mixture_posterior: [N, C] tensor
+    """
+    print(f"Computing mixture posterior from logits shape: {logits.shape}")
+
+    # Convert logits to posteriors
+    expert_posteriors = F.softmax(logits, dim=-1)  # [N, E, C]
+
+    # Get gating weights
+    with torch.no_grad():
+        weights, _ = gating(expert_posteriors)  # [N, E]
+
+    # Compute mixture: η̃(x) = Σ_e w_e · p^(e)(y|x)
+    mixture_posterior = torch.sum(
+        weights.unsqueeze(-1) * expert_posteriors,
+        dim=1,  # Sum over experts
+    )  # [N, C]
+
+    print(f"✓ Mixture posterior shape: {mixture_posterior.shape}")
+
+    return mixture_posterior
 
 
 def load_labels(split: str, device: str = DEVICE) -> torch.Tensor:
     # Prefer saved targets alongside logits
-    cand = Path(CFG.logits_dir) / CFG.expert_names[0] / f"{split}_targets.pt"
-    if cand.exists():
-        t = torch.load(cand, map_location=device)
-        if isinstance(t, torch.Tensor):
-            return t.to(device=device, dtype=torch.long)
+    for expert_name in CFG.expert_names:
+        cand = Path(CFG.logits_dir) / expert_name / f"{split}_targets.pt"
+        if cand.exists():
+            t = torch.load(cand, map_location=device)
+            if isinstance(t, torch.Tensor):
+                return t.to(device=device, dtype=torch.long)
 
     # Fallback: reconstruct from CIFAR100 and indices
     import torchvision
@@ -153,13 +216,11 @@ def load_class_weights(device: str = DEVICE) -> torch.Tensor:
     counts = np.array(class_counts, dtype=np.float64)
     total_train = counts.sum()
 
-    # CORRECTED: Calculate inverse weights to re-weight test set to training distribution
-    # Test set is balanced (1/num_classes per class), training set is long-tail
+    # Calculate inverse weights to re-weight test set to training distribution
     train_probs = counts / total_train
     test_probs = np.ones(CFG.num_classes) / CFG.num_classes  # Balanced test set
 
     # Importance weights = train_probs / test_probs = train_probs * num_classes
-    # This up-weights head classes and down-weights tail classes
     weights = train_probs * CFG.num_classes
 
     print(
@@ -170,101 +231,6 @@ def load_class_weights(device: str = DEVICE) -> torch.Tensor:
     print(f"Weight ratio (head/tail): {weights[0] / weights[-1]:.1f}x")
 
     return torch.tensor(weights, dtype=torch.float32, device=device)
-
-
-def load_gating_network(device: str = DEVICE):  # Returns GatingNetwork
-    """Load trained gating network."""
-    from src.models.gating_network_map import GatingNetwork
-
-    num_experts = len(CFG.expert_names)
-    num_classes = CFG.num_classes
-
-    print(f"Loading gating network for {num_experts} experts: {CFG.expert_names}")
-
-    gating = GatingNetwork(
-        num_experts=num_experts, num_classes=num_classes, routing="dense"
-    ).to(device)
-
-    checkpoint_path = Path(CFG.gating_checkpoint)
-    if not checkpoint_path.exists():
-        raise FileNotFoundError(f"Missing gating checkpoint: {checkpoint_path}")
-
-    checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
-
-    # Verify checkpoint matches expected number of experts
-    if "model_state_dict" in checkpoint:
-        state_dict = checkpoint["model_state_dict"]
-        # Check if mlp output layer has correct number of experts
-        if (
-            "mlp.mlp.8.weight" in state_dict
-        ):  # Last layer of MLP (assuming 2 hidden layers)
-            mlp_output_dim = state_dict["mlp.mlp.8.weight"].shape[0]
-            if mlp_output_dim != num_experts:
-                raise ValueError(
-                    f"Checkpoint expects {mlp_output_dim} experts but config has {num_experts} experts. "
-                    f"Please check expert_names: {CFG.expert_names}"
-                )
-
-    gating.load_state_dict(checkpoint["model_state_dict"])
-    gating.eval()
-
-    print(f"✓ Loaded gating network from: {checkpoint_path}")
-    print(f"✓ Gating network configured for {num_experts} experts: {CFG.expert_names}")
-    return gating
-
-
-def compute_mixture_posterior(
-    expert_logits: torch.Tensor,
-    gating_net,
-    device: str = DEVICE,  # gating_net: GatingNetwork
-) -> torch.Tensor:
-    """Compute mixture posterior using gating network."""
-    # expert_logits: [N, E, C]
-    with torch.no_grad():
-        # Convert logits to posteriors
-        expert_posteriors = F.softmax(expert_logits, dim=-1)  # [N, E, C]
-
-        # Verify shape matches expected number of experts
-        num_experts_logits = expert_logits.shape[1]
-        num_experts_config = len(CFG.expert_names)
-        if num_experts_logits != num_experts_config:
-            raise ValueError(
-                f"Mismatch: logits have {num_experts_logits} experts but config expects {num_experts_config} experts"
-            )
-
-        # Get gating weights
-        gating_output = gating_net(expert_posteriors)
-        if isinstance(gating_output, tuple):
-            gating_weights = gating_output[0]  # [N, E]
-        else:
-            gating_weights = gating_output  # [N, E]
-
-        # Check for NaN
-        if torch.isnan(gating_weights).any():
-            print("WARNING: Gating produces NaN! Falling back to uniform weights")
-            N, E = expert_logits.shape[0], expert_logits.shape[1]
-            gating_weights = torch.ones(N, E, device=device) / E
-
-        # Verify gating weights sum to 1
-        weight_sum = gating_weights.sum(dim=1)
-        if not torch.allclose(weight_sum, torch.ones_like(weight_sum), atol=1e-5):
-            print(
-                f"WARNING: Gating weights don't sum to 1! Mean sum: {weight_sum.mean().item():.6f}"
-            )
-
-        # Mixture posterior: η̃(x) = Σ_e w_e · p^(e)(y|x)
-        mixture_posterior = (gating_weights.unsqueeze(-1) * expert_posteriors).sum(
-            dim=1
-        )  # [N, C]
-
-        # Verify mixture is valid probability distribution
-        mixture_sum = mixture_posterior.sum(dim=1)
-        if not torch.allclose(mixture_sum, torch.ones_like(mixture_sum), atol=1e-5):
-            print(
-                f"WARNING: Mixture posterior doesn't sum to 1! Mean sum: {mixture_sum.mean().item():.6f}"
-            )
-
-        return mixture_posterior
 
 
 def ensure_dirs():
@@ -315,17 +281,11 @@ class BalancedLtRPlugin(nn.Module):
     def _mu_class(self) -> torch.Tensor:
         return self.mu_group[self.class_to_group]
 
-    def _alpha_hat_class(self) -> torch.Tensor:
-        # α̂_k = α_k · β_k ; for balanced β_k = 1/K ⇒ α̂ = α / K
-        K = float(self.alpha_group.numel())
-        alpha_hat_group = self.alpha_group / max(K, 1.0)
-        return alpha_hat_group[self.class_to_group]
-
     @torch.no_grad()
     def predict(self, posterior: torch.Tensor) -> torch.Tensor:
         eps = 1e-12
-        alpha_hat = self._alpha_hat_class().clamp(min=eps)
-        reweighted = posterior / alpha_hat.unsqueeze(0)
+        alpha = self._alpha_class().clamp(min=eps)
+        reweighted = posterior / alpha.unsqueeze(0)
         return reweighted.argmax(dim=-1)
 
     @torch.no_grad()
@@ -333,11 +293,11 @@ class BalancedLtRPlugin(nn.Module):
         self, posterior: torch.Tensor, cost: Optional[float] = None
     ) -> torch.Tensor:
         eps = 1e-12
-        alpha_hat = self._alpha_hat_class().clamp(min=eps)
+        alpha = self._alpha_class().clamp(min=eps)
         mu = self._mu_class()
-        inv_alpha_hat = 1.0 / alpha_hat
-        max_reweighted = (posterior * inv_alpha_hat.unsqueeze(0)).max(dim=-1)[0]
-        threshold = ((inv_alpha_hat - mu).unsqueeze(0) * posterior).sum(dim=-1)
+        inv_alpha = 1.0 / alpha
+        max_reweighted = (posterior * inv_alpha.unsqueeze(0)).max(dim=-1)[0]
+        threshold = ((inv_alpha - mu).unsqueeze(0) * posterior).sum(dim=-1)
         c = self.cost.item() if cost is None else float(cost)
         return max_reweighted < (threshold - c)
 
@@ -376,6 +336,12 @@ def compute_metrics(
     if class_weights is not None:
         device = labels.device
         class_weights = class_weights.to(device)
+        print(
+            f"DEBUG: Using importance weighting with class_weights shape: {class_weights.shape}"
+        )
+        print(
+            f"DEBUG: Class weights range: {class_weights.min().item():.6f} to {class_weights.max().item():.6f}"
+        )
 
         for g in range(num_groups):
             mask = groups == g
@@ -397,6 +363,7 @@ def compute_metrics(
                 else:
                     group_errors.append(1.0)
     else:
+        print("DEBUG: NOT using importance weighting")
         for g in range(num_groups):
             mask = groups == g
 
@@ -429,17 +396,13 @@ def initialize_alpha(labels: torch.Tensor, class_to_group: torch.Tensor) -> np.n
     N = len(labels)
     for g in range(K):
         group_mask = class_to_group[labels] == g
-        prop = group_mask.sum().float().item() / max(N, 1)
-        alpha[g] = float(K * prop)
+        alpha[g] = group_mask.sum().float().item() / N
     return alpha
 
 
 @torch.no_grad()
 def update_alpha_from_coverage(
-    reject: torch.Tensor,
-    labels: torch.Tensor,
-    class_to_group: torch.Tensor,
-    class_weights: Optional[torch.Tensor] = None,
+    reject: torch.Tensor, labels: torch.Tensor, class_to_group: torch.Tensor
 ) -> np.ndarray:
     K = int(class_to_group.max().item() + 1)
     alpha = np.zeros(K, dtype=np.float64)
@@ -448,24 +411,11 @@ def update_alpha_from_coverage(
     if accept.sum() == 0:
         return np.ones(K, dtype=np.float64) * 0.5
 
-    if class_weights is not None:
-        cw = class_weights.to(labels.device)
-        sample_w = cw[labels]
-        total_weight = sample_w.sum().item()
-        total_weight = max(total_weight, 1e-12)
-        for g in range(K):
-            in_group = class_to_group[labels] == g
-            accepted_in_group = accept & in_group
-            w_acc_g = sample_w[accepted_in_group].sum().item()
-            cov_g = float(np.clip(w_acc_g / total_weight, 1e-12, 1.0))
-            alpha[g] = float(K * cov_g)
-        return alpha
-
     for g in range(K):
         in_group = class_to_group[labels] == g
         accepted_in_group = accept & in_group
         empirical_cov = accepted_in_group.sum().float().item() / max(N, 1)
-        alpha[g] = float(K * np.clip(empirical_cov, 1e-6, 1.0))
+        alpha[g] = float(np.clip(empirical_cov, 1e-6, 1.0))
     return alpha
 
 
@@ -486,6 +436,7 @@ def power_iter_search(
     alpha = initialize_alpha(labels, class_to_group)
     mu_t = torch.tensor(mu, dtype=torch.float32, device=DEVICE)
     K = int(class_to_group.max().item() + 1)
+    beta_scale = 1.0 / float(K)
 
     for it in range(num_iters):
         alpha_hat = alpha.astype(np.float32)
@@ -498,9 +449,7 @@ def power_iter_search(
         plugin.set_params(alpha_t, mu_t, c_it)
         preds = plugin.predict(posterior)
         rej = plugin.reject(posterior)
-        alpha_new = update_alpha_from_coverage(
-            rej, labels, class_to_group, class_weights=class_weights
-        )
+        alpha_new = update_alpha_from_coverage(rej, labels, class_to_group)
         if damping > 0.0:
             alpha = (1.0 - damping) * alpha + damping * alpha_new
         else:
@@ -535,21 +484,19 @@ def compute_cost_for_target_rejection(
     mu: np.ndarray,
     target_rejection: float,
 ) -> float:
-    """Compute cost c to achieve a target rejection rate r."""
+    """Compute cost c to achieve a target rejection rate r using posterior."""
     eps = 1e-12
     K = int(class_to_group.max().item() + 1)
     C = int(class_to_group.numel())
     alpha_t = torch.tensor(alpha, dtype=torch.float32, device=DEVICE)
     mu_t = torch.tensor(mu, dtype=torch.float32, device=DEVICE)
     if alpha_t.numel() == K:
-        alpha_group = alpha_t
-        mu_group = mu_t
-        alpha_hat_group = alpha_group / max(float(K), 1.0)
-        alpha_t = alpha_hat_group[class_to_group]
-        mu_t = mu_group[class_to_group]
-    inv_alpha_hat = 1.0 / alpha_t.clamp(min=eps)
-    max_rew = (posterior * inv_alpha_hat.unsqueeze(0)).max(dim=-1)[0]
-    thresh_base = ((inv_alpha_hat - mu_t).unsqueeze(0) * posterior).sum(dim=-1)
+        alpha_t = alpha_t[class_to_group]
+        mu_t = mu_t[class_to_group]
+
+    inv_alpha = 1.0 / alpha_t.clamp(min=eps)
+    max_rew = (posterior * inv_alpha.unsqueeze(0)).max(dim=-1)[0]
+    thresh_base = ((inv_alpha - mu_t).unsqueeze(0) * posterior).sum(dim=-1)
     t = thresh_base - max_rew
     t_sorted = torch.sort(t)[0]
     q = max(0.0, min(1.0, 1.0 - float(target_rejection)))
@@ -593,31 +540,153 @@ def compute_rc_curve(
 # ================================
 
 
-def plot_rc_dual(
-    r: np.ndarray,
-    e_bal: np.ndarray,
-    e_wst: np.ndarray,
-    aurc_bal: float,
-    aurc_wst: float,
-    out_path: Path,
-):
-    plt.figure(figsize=(7, 5))
-    plt.plot(r, e_bal, "o-", color="green", label=f"Balanced (AURC={aurc_bal:.4f})")
-    plt.plot(
-        r, e_wst, "s-", color="royalblue", label=f"Worst-group (AURC={aurc_wst:.4f})"
+def plot_rc(rc: Dict[str, np.ndarray], out_path: Path):
+    r = rc["rejection_rates"]
+    e_balanced = rc["balanced_errors"]
+    aurc_balanced = rc["aurc"]
+
+    # Extract worst errors and group errors if available
+    e_worst = rc.get("worst_errors", None)
+    aurc_worst = rc.get("aurc_worst", None)
+    head_errors = rc.get("head_errors", None)
+    tail_errors = rc.get("tail_errors", None)
+
+    # Calculate tail - head error gap
+    error_gap = None
+    aurc_gap = None
+    if head_errors is not None and tail_errors is not None:
+        error_gap = tail_errors - head_errors
+        if error_gap.size > 1:
+            aurc_gap = float(np.trapz(error_gap, r))
+
+    # Create figure with subplots
+    if head_errors is not None or tail_errors is not None:
+        fig, axes = plt.subplots(1, 3, figsize=(20, 5))
+        ax1, ax2, ax3 = axes
+    else:
+        fig, ax1 = plt.subplots(1, 1, figsize=(7, 5))
+        ax2 = None
+        ax3 = None
+
+    # Main RC curve plot (left subplot)
+    ax1.plot(
+        r,
+        e_balanced,
+        "o-",
+        color="green",
+        linewidth=2,
+        markersize=6,
+        label=f"Balanced Error (AURC={aurc_balanced:.4f})",
     )
-    plt.xlabel("Proportion of Rejections")
-    plt.ylabel("Error")
-    plt.title("Balanced and Worst-group Error vs Rejection Rate")
-    plt.grid(True, alpha=0.3)
-    plt.legend()
-    plt.xlim([0, 1])
-    ymax = 0.0
-    if e_bal.size:
-        ymax = max(ymax, float(e_bal.max()))
-    if e_wst.size:
-        ymax = max(ymax, float(e_wst.max()))
-    plt.ylim([0, min(1.05, ymax * 1.1 if ymax > 0 else 1.0)])
+
+    if e_worst is not None:
+        ax1.plot(
+            r,
+            e_worst,
+            "s--",
+            color="red",
+            linewidth=2,
+            markersize=5,
+            label=f"Worst Group Error (AURC={aurc_worst:.4f})"
+            if aurc_worst
+            else "Worst Group Error",
+        )
+
+    ax1.set_xlabel("Proportion of Rejections", fontsize=11)
+    ax1.set_ylabel("Error Rate", fontsize=11)
+    ax1.set_title(
+        "Balanced Error vs Rejection Rate (Gating)", fontsize=12, fontweight="bold"
+    )
+    ax1.grid(True, alpha=0.3)
+    ax1.legend(loc="best", fontsize=10)
+    ax1.set_xlim([0, 1])
+    y_max = max(
+        e_balanced.max() if e_balanced.size > 0 else 0,
+        e_worst.max() if e_worst is not None and e_worst.size > 0 else 0,
+    )
+    ax1.set_ylim([0, min(1.05, y_max * 1.1)])
+
+    # Group errors plot (middle subplot)
+    if ax2 is not None and head_errors is not None and tail_errors is not None:
+        ax2.plot(
+            r,
+            head_errors,
+            "o-",
+            color="blue",
+            linewidth=2,
+            markersize=6,
+            label="Head Group Error",
+        )
+        ax2.plot(
+            r,
+            tail_errors,
+            "s-",
+            color="orange",
+            linewidth=2,
+            markersize=6,
+            label="Tail Group Error",
+        )
+
+        ax2.set_xlabel("Proportion of Rejections", fontsize=11)
+        ax2.set_ylabel("Group Error Rate", fontsize=11)
+        ax2.set_title("Head vs Tail Group Errors", fontsize=12, fontweight="bold")
+        ax2.grid(True, alpha=0.3)
+        ax2.legend(loc="best", fontsize=10)
+        ax2.set_xlim([0, 1])
+        y_max_groups = max(
+            head_errors.max() if head_errors.size > 0 else 0,
+            tail_errors.max() if tail_errors.size > 0 else 0,
+        )
+        ax2.set_ylim([0, min(1.05, y_max_groups * 1.1)])
+
+    # Error gap plot (right subplot)
+    if ax3 is not None and error_gap is not None:
+        # Positive values mean tail > head (tail worse)
+        # Negative values mean tail < head (head worse)
+        color = "purple"
+        ax3.plot(
+            r,
+            error_gap,
+            "^-",
+            color=color,
+            linewidth=2,
+            markersize=6,
+            label=f"Tail - Head Gap (AUC={aurc_gap:.4f})"
+            if aurc_gap
+            else "Tail - Head Gap",
+        )
+        # Add horizontal line at y=0 for reference
+        ax3.axhline(
+            y=0, color="black", linestyle=":", linewidth=1, alpha=0.5, label="Zero Gap"
+        )
+
+        ax3.set_xlabel("Proportion of Rejections", fontsize=11)
+        ax3.set_ylabel("Error Gap (Tail - Head)", fontsize=11)
+        ax3.set_title("Error Gap: Tail vs Head", fontsize=12, fontweight="bold")
+        ax3.grid(True, alpha=0.3)
+        ax3.legend(loc="best", fontsize=10)
+        ax3.set_xlim([0, 1])
+
+        # Auto-scale y-axis based on data
+        gap_max = abs(error_gap.max()) if error_gap.size > 0 else 0
+        gap_min = abs(error_gap.min()) if error_gap.size > 0 else 0
+        y_limit = max(gap_max, gap_min) * 1.2
+        ax3.set_ylim(
+            [-y_limit if y_limit > 0 else -0.1, y_limit if y_limit > 0 else 0.1]
+        )
+
+        # Add text annotation for interpretation
+        if error_gap.max() > 0:
+            ax3.text(
+                0.02,
+                0.98,
+                "Positive = Tail worse",
+                transform=ax3.transAxes,
+                fontsize=9,
+                verticalalignment="top",
+                bbox=dict(boxstyle="round", facecolor="wheat", alpha=0.5),
+            )
+
     plt.tight_layout()
     plt.savefig(out_path, dpi=150, bbox_inches="tight")
     plt.close()
@@ -633,19 +702,28 @@ def main():
     np.random.seed(CFG.seed)
     ensure_dirs()
 
-    print("Loading gating network...")
-    gating = load_gating_network(DEVICE)
+    print("\n" + "=" * 70)
+    print("LOADING DATA AND GATING")
+    print("=" * 70)
 
-    print("Loading S1 (tunev) and S2 (val) for selection/evaluation...")
-    expert_logits_tunev = load_expert_logits(CFG.expert_names, "tunev", DEVICE)
+    # Load gating network
+    gating = load_gating_network()
+
+    # Load logits and labels for all splits
+    print("\nLoading expert logits...")
+    logits_tunev = load_expert_logits("tunev", DEVICE)
+    logits_val = load_expert_logits("val", DEVICE)
+    logits_test = load_expert_logits("test", DEVICE)
+
+    print("\nLoading labels...")
     labels_tunev = load_labels("tunev", DEVICE)
-
-    expert_logits_val = load_expert_logits(CFG.expert_names, "val", DEVICE)
     labels_val = load_labels("val", DEVICE)
+    labels_test = load_labels("test", DEVICE)
 
-    print("Computing mixture posteriors using gating network...")
-    posterior_tunev = compute_mixture_posterior(expert_logits_tunev, gating, DEVICE)
-    posterior_val = compute_mixture_posterior(expert_logits_val, gating, DEVICE)
+    print("\nComputing mixture posteriors using gating network...")
+    posterior_tunev = compute_mixture_posterior(logits_tunev, gating, DEVICE)
+    posterior_val = compute_mixture_posterior(logits_val, gating, DEVICE)
+    posterior_test = compute_mixture_posterior(logits_test, gating, DEVICE)
 
     print("Building class-to-group mapping (tail <= 20)...")
     class_to_group = build_class_to_group()
@@ -654,28 +732,23 @@ def main():
     class_weights = load_class_weights(DEVICE)
 
     # Check baseline balanced error on test set
-    expert_logits_test = load_expert_logits(CFG.expert_names, "test", DEVICE)
-    labels_test = load_labels("test", DEVICE)
-    posterior_test = compute_mixture_posterior(expert_logits_test, gating, DEVICE)
-
-    # Compute baseline balanced error (no rejection) with importance weighting
-    mix_pred_test = posterior_test.argmax(dim=-1)
+    ce_pred_test = posterior_test.argmax(dim=-1)
     groups_test = class_to_group[labels_test]
     num_groups = int(class_to_group.max().item() + 1)
 
     dummy_reject = torch.zeros(len(labels_test), dtype=torch.bool, device=DEVICE)
     baseline_metrics = compute_metrics(
-        mix_pred_test, labels_test, dummy_reject, class_to_group, class_weights
+        ce_pred_test, labels_test, dummy_reject, class_to_group, class_weights
     )
 
     baseline_balanced_error = baseline_metrics["balanced_error"]
-    print(f"Baseline Gating balanced error (TEST) = {baseline_balanced_error:.4f}")
+    print(f"\nBaseline Gating balanced error (TEST) = {baseline_balanced_error:.4f}")
     print(f"Baseline Gating group errors = {baseline_metrics['group_errors']}")
     print(
-        f"Baseline Gating overall accuracy (TEST) = {(mix_pred_test == labels_test).float().mean().item():.4f}"
+        f"Baseline Gating overall accuracy (TEST) = {(ce_pred_test == labels_test).float().mean().item():.4f}"
     )
 
-    print("Creating plug-in model...")
+    print("\nCreating plug-in model...")
     plugin = BalancedLtRPlugin(class_to_group).to(DEVICE)
 
     # Target rejection grid (paper-style points)
@@ -684,7 +757,6 @@ def main():
     for i, target_rej in enumerate(targets):
         print(f"\n=== Target {i + 1}/{len(targets)}: rejection={target_rej:.1f} ===")
 
-        # Follow paper Algorithm 1 - optimize on tunev, select on val
         print("   Step 1: Optimizing (alpha, mu) on tunev for each mu...")
         candidates = []
         for lam in CFG.mu_lambda_grid:
@@ -705,7 +777,6 @@ def main():
             candidates.append((alpha_found, mu))
             print(f"     mu={lam:5.1f}: alpha={alpha_found}")
 
-        # Select best mu based on val performance
         print("   Step 2: Selecting best mu based on val performance...")
         best = {
             "objective": float("inf"),
@@ -804,23 +875,12 @@ def main():
             f"   Final selection: mu={best['mu'][1]:.2f} val_bal={best['val_metrics']['balanced_error']:.4f} val_cov={best['val_metrics']['coverage']:.3f}"
         )
         print(f"   Best alpha: {best['alpha']}")
-        K_groups = int(class_to_group.max().item() + 1)
-        print(
-            f"   Alpha sum: {np.sum(best['alpha']):.4f} (should be ≈ {K_groups * best['val_metrics']['coverage']:.4f})"
-        )
-        print(f"   Alpha_hat (=alpha/K): {best['alpha'] / float(K_groups)}")
 
-        # Evaluate best (alpha, mu, c) on val and test
+        # Evaluate best (alpha, mu, c) on test
         alpha_best = np.array(best["alpha"], dtype=np.float64)
         mu_best = np.array(best["mu"], dtype=np.float64)
 
         m_val = best["val_metrics"]
-        if len(m_val["group_errors"]) >= 2:
-            head_err_v = float(m_val["group_errors"][0])
-            tail_err_v = float(m_val["group_errors"][1])
-            gap_v = tail_err_v - head_err_v
-        else:
-            head_err_v = tail_err_v = gap_v = float("nan")
 
         cost_test = compute_cost_for_target_rejection(
             posterior_test, class_to_group, alpha_best, mu_best, target_rej
@@ -846,37 +906,6 @@ def main():
             f"   Target={target_rej:.1f}  TEST: bal={m_test['balanced_error']:.4f} cov={m_test['coverage']:.3f}"
         )
 
-        wge_v = (
-            float(m_val["worst_group_error"])
-            if "worst_group_error" in m_val
-            else float("nan")
-        )
-        if len(m_test["group_errors"]) >= 2:
-            head_err_t = float(m_test["group_errors"][0])
-            tail_err_t = float(m_test["group_errors"][1])
-            gap_t = tail_err_t - head_err_t
-        else:
-            head_err_t = tail_err_t = gap_t = float("nan")
-        wge_t = (
-            float(m_test["worst_group_error"])
-            if "worst_group_error" in m_test
-            else float("nan")
-        )
-        print(
-            f"      VAL: worst={wge_v:.4f} | head={head_err_v:.4f} | tail={tail_err_v:.4f} | tail-head={gap_v:.4f}"
-        )
-        print(
-            f"      TEST: worst={wge_t:.4f} | head={head_err_t:.4f} | tail={tail_err_t:.4f} | tail-head={gap_t:.4f}"
-        )
-
-        if abs(target_rej - 0.0) < 1e-6:
-            print(f"   alpha (group) learned = {alpha_best}")
-            mix_pred_test = posterior_test.argmax(dim=-1)
-            mix_acc_test = (mix_pred_test == labels_test).float().mean().item()
-            plugin_acc_test = 1.0 - m_test["balanced_error"]
-            print(f"   Baseline Gating acc (TEST) = {mix_acc_test:.4f}")
-            print(f"   Plugin balanced complement (1-bErr) ~ {plugin_acc_test:.4f}")
-
         results_per_cost.append(
             {
                 "target_rejection": float(target_rej),
@@ -891,17 +920,17 @@ def main():
                 "selection_method": "val_based",
                 "val_metrics": {
                     "balanced_error": float(m_val["balanced_error"]),
-                    "worst_group_error": float(m_val["worst_group_error"]),
                     "coverage": float(m_val["coverage"]),
                     "rejection_rate": float(1.0 - m_val["coverage"]),
                     "group_errors": [float(x) for x in m_val["group_errors"]],
+                    "worst_group_error": float(m_val["worst_group_error"]),
                 },
                 "test_metrics": {
                     "balanced_error": float(m_test["balanced_error"]),
-                    "worst_group_error": float(m_test["worst_group_error"]),
                     "coverage": float(m_test["coverage"]),
                     "rejection_rate": float(1.0 - m_test["coverage"]),
                     "group_errors": [float(x) for x in m_test["group_errors"]],
+                    "worst_group_error": float(m_test["worst_group_error"]),
                 },
             }
         )
@@ -909,126 +938,105 @@ def main():
     # Build unified RC curve (balanced) from target points
     r_val = np.array([1.0 - r["val_metrics"]["coverage"] for r in results_per_cost])
     e_val = np.array([r["val_metrics"]["balanced_error"] for r in results_per_cost])
-    w_val = np.array([r["val_metrics"]["worst_group_error"] for r in results_per_cost])
-    gap_val = np.array(
-        [
-            r["val_metrics"]["group_errors"][1] - r["val_metrics"]["group_errors"][0]
-            for r in results_per_cost
-        ]
+    e_worst_val = np.array(
+        [r["val_metrics"]["worst_group_error"] for r in results_per_cost]
     )
+    head_errors_val = np.array(
+        [r["val_metrics"]["group_errors"][0] for r in results_per_cost]
+    )
+    tail_errors_val = np.array(
+        [r["val_metrics"]["group_errors"][1] for r in results_per_cost]
+    )
+
     r_test = np.array([1.0 - r["test_metrics"]["coverage"] for r in results_per_cost])
     e_test = np.array([r["test_metrics"]["balanced_error"] for r in results_per_cost])
-    w_test = np.array(
+    e_worst_test = np.array(
         [r["test_metrics"]["worst_group_error"] for r in results_per_cost]
     )
-    gap_test = np.array(
-        [
-            r["test_metrics"]["group_errors"][1] - r["test_metrics"]["group_errors"][0]
-            for r in results_per_cost
-        ]
+    head_errors_test = np.array(
+        [r["test_metrics"]["group_errors"][0] for r in results_per_cost]
+    )
+    tail_errors_test = np.array(
+        [r["test_metrics"]["group_errors"][1] for r in results_per_cost]
     )
 
     idx_v = np.argsort(r_val)
-    r_val, e_val, w_val, gap_val = (
-        r_val[idx_v],
-        e_val[idx_v],
-        w_val[idx_v],
-        gap_val[idx_v],
-    )
-    idx_t = np.argsort(r_test)
-    r_test, e_test, w_test, gap_test = (
-        r_test[idx_t],
-        e_test[idx_t],
-        w_test[idx_t],
-        gap_test[idx_t],
-    )
+    r_val, e_val = r_val[idx_v], e_val[idx_v]
+    e_worst_val = e_worst_val[idx_v]
+    head_errors_val = head_errors_val[idx_v]
+    tail_errors_val = tail_errors_val[idx_v]
 
-    aurc_val_bal = (
+    idx_t = np.argsort(r_test)
+    r_test, e_test = r_test[idx_t], e_test[idx_t]
+    e_worst_test = e_worst_test[idx_t]
+    head_errors_test = head_errors_test[idx_t]
+    tail_errors_test = tail_errors_test[idx_t]
+
+    aurc_val = (
         float(np.trapz(e_val, r_val))
         if r_val.size > 1
         else float(e_val.mean() if e_val.size else 0.0)
     )
-    aurc_test_bal = (
+    aurc_worst_val = (
+        float(np.trapz(e_worst_val, r_val))
+        if r_val.size > 1
+        else float(e_worst_val.mean() if e_worst_val.size else 0.0)
+    )
+    aurc_test = (
         float(np.trapz(e_test, r_test))
         if r_test.size > 1
         else float(e_test.mean() if e_test.size else 0.0)
     )
-    aurc_val_wst = (
-        float(np.trapz(w_val, r_val))
-        if r_val.size > 1
-        else float(w_val.mean() if w_val.size else 0.0)
-    )
-    aurc_test_wst = (
-        float(np.trapz(w_test, r_test))
+    aurc_worst_test = (
+        float(np.trapz(e_worst_test, r_test))
         if r_test.size > 1
-        else float(w_test.mean() if w_test.size else 0.0)
+        else float(e_worst_test.mean() if e_worst_test.size else 0.0)
     )
 
-    # Practical AURC over coverage >= 0.2 → rejection <= 0.8
-    if r_val.size > 1:
-        mask_val_08 = r_val <= 0.8
-        aurc_val_bal_08 = (
-            float(np.trapz(e_val[mask_val_08], r_val[mask_val_08]))
-            if mask_val_08.sum() > 1
-            else float(e_val[mask_val_08].mean() if mask_val_08.any() else aurc_val_bal)
-        )
-        aurc_val_wst_08 = (
-            float(np.trapz(w_val[mask_val_08], r_val[mask_val_08]))
-            if mask_val_08.sum() > 1
-            else float(w_val[mask_val_08].mean() if mask_val_08.any() else aurc_val_wst)
-        )
-    else:
-        aurc_val_bal_08 = aurc_val_bal
-        aurc_val_wst_08 = aurc_val_wst
-
-    if r_test.size > 1:
-        mask_test_08 = r_test <= 0.8
-        aurc_test_bal_08 = (
-            float(np.trapz(e_test[mask_test_08], r_test[mask_test_08]))
-            if mask_test_08.sum() > 1
-            else float(
-                e_test[mask_test_08].mean() if mask_test_08.any() else aurc_test_bal
-            )
-        )
-        aurc_test_wst_08 = (
-            float(np.trapz(w_test[mask_test_08], r_test[mask_test_08]))
-            if mask_test_08.sum() > 1
-            else float(
-                w_test[mask_test_08].mean() if mask_test_08.any() else aurc_test_wst
-            )
-        )
-    else:
-        aurc_test_bal_08 = aurc_test_bal
-        aurc_test_wst_08 = aurc_test_wst
+    # Calculate error gap (tail - head) for both val and test
+    error_gap_test = tail_errors_test - head_errors_test
+    error_gap_val = tail_errors_val - head_errors_val
+    aurc_gap_test = (
+        float(np.trapz(error_gap_test, r_test))
+        if error_gap_test.size > 1
+        else float(error_gap_test.mean() if error_gap_test.size else 0.0)
+    )
+    aurc_gap_val = (
+        float(np.trapz(error_gap_val, r_val))
+        if error_gap_val.size > 1
+        else float(error_gap_val.mean() if error_gap_val.size else 0.0)
+    )
 
     save_dict = {
-        "objectives": ["balanced", "worst_group"],
-        "description": "CORRECTED: Targeted rejection grid (0.0..0.8) with val-based hyperparameter selection per paper Algorithm 1. Uses 3 experts with gating network.",
-        "method": "plug-in_balanced_val_selection_gating",
+        "objective": "balanced",
+        "description": "Gating with 3 experts (CE, LogitAdjust, BalancedSoftmax) - Targeted rejection grid with val-based hyperparameter selection per paper Algorithm 1",
+        "method": "plug-in_balanced_val_selection_with_gating",
+        "experts": CFG.expert_names,
         "hyperparameter_selection": "val_based",
         "algorithm": "Algorithm 1 from paper - optimize (α,μ) on tunev, select μ on val",
-        "experts": CFG.expert_names,
         "results_per_cost": results_per_cost,
         "rc_curve": {
             "val": {
                 "rejection_rates": r_val.tolist(),
                 "balanced_errors": e_val.tolist(),
-                "worst_group_errors": w_val.tolist(),
-                "tail_minus_head": gap_val.tolist(),
-                "aurc_balanced": aurc_val_bal,
-                "aurc_worst_group": aurc_val_wst,
-                "aurc_balanced_coverage_ge_0_2": aurc_val_bal_08,
-                "aurc_worst_group_coverage_ge_0_2": aurc_val_wst_08,
+                "worst_errors": e_worst_val.tolist(),
+                "head_errors": head_errors_val.tolist(),
+                "tail_errors": tail_errors_val.tolist(),
+                "error_gap": error_gap_val.tolist(),
+                "aurc": aurc_val,
+                "aurc_worst": aurc_worst_val,
+                "aurc_gap": aurc_gap_val,
             },
             "test": {
                 "rejection_rates": r_test.tolist(),
                 "balanced_errors": e_test.tolist(),
-                "worst_group_errors": w_test.tolist(),
-                "tail_minus_head": gap_test.tolist(),
-                "aurc_balanced": aurc_test_bal,
-                "aurc_worst_group": aurc_test_wst,
-                "aurc_balanced_coverage_ge_0_2": aurc_test_bal_08,
-                "aurc_worst_group_coverage_ge_0_2": aurc_test_wst_08,
+                "worst_errors": e_worst_test.tolist(),
+                "head_errors": head_errors_test.tolist(),
+                "tail_errors": tail_errors_test.tolist(),
+                "error_gap": error_gap_test.tolist(),
+                "aurc": aurc_test,
+                "aurc_worst": aurc_worst_test,
+                "aurc_gap": aurc_gap_test,
             },
         },
     }
@@ -1036,44 +1044,27 @@ def main():
     out_json = Path(CFG.results_dir) / "ltr_plugin_gating_balanced.json"
     with open(out_json, "w", encoding="utf-8") as f:
         json.dump(save_dict, f, indent=2)
-    print(f"Saved results to: {out_json}")
+    print(f"\n✓ Saved results to: {out_json}")
 
-    # Print AURCs
-    print(f"Val AURC - Balanced: {aurc_val_bal:.4f} | Worst-group: {aurc_val_wst:.4f}")
-    print(
-        f"Test AURC - Balanced: {aurc_test_bal:.4f} | Worst-group: {aurc_test_wst:.4f}"
+    # Plot test RC curve with worst error and head/tail errors
+    plot_path = (
+        Path(CFG.results_dir) / "ltr_rc_curves_balanced_gating_test_old_iter.png"
     )
-    print(
-        f"Val AURC (coverage>=0.2) - Balanced: {aurc_val_bal_08:.4f} | Worst-group: {aurc_val_wst_08:.4f}"
+    plot_rc(
+        {
+            "rejection_rates": r_test,
+            "balanced_errors": e_test,
+            "worst_errors": e_worst_test,
+            "head_errors": head_errors_test,
+            "tail_errors": tail_errors_test,
+            "error_gap": error_gap_test,
+            "aurc": aurc_test,
+            "aurc_worst": aurc_worst_test,
+            "aurc_gap": aurc_gap_test,
+        },
+        plot_path,
     )
-    print(
-        f"Test AURC (coverage>=0.2) - Balanced: {aurc_test_bal_08:.4f} | Worst-group: {aurc_test_wst_08:.4f}"
-    )
-
-    # Plot test RC curves (both metrics)
-    plot_path = Path(CFG.results_dir) / "ltr_rc_curves_balanced_gating_test.png"
-    plot_rc_dual(r_test, e_test, w_test, aurc_test_bal, aurc_test_wst, plot_path)
-    print(f"Saved combined plot to: {plot_path}")
-
-    # Plot Tail - Head gap curve
-    gap_plot_path = Path(CFG.results_dir) / "ltr_tail_minus_head_gating_test.png"
-    plt.figure(figsize=(7, 5))
-    plt.plot(r_test, gap_test, "d-", color="crimson", label="Tail - Head error")
-    plt.xlabel("Proportion of Rejections")
-    plt.ylabel("Tail Error - Head Error")
-    plt.title("Tail-Head Error Gap vs Rejection Rate")
-    plt.axhline(0.0, color="gray", linestyle="--", linewidth=1)
-    plt.grid(True, alpha=0.3)
-    plt.legend()
-    plt.xlim([0, 1])
-    ymin = float(min(0.0, gap_test.min() if gap_test.size else 0.0))
-    ymax = float(max(0.0, gap_test.max() if gap_test.size else 0.0))
-    pad = 0.05 * (ymax - ymin + 1e-8)
-    plt.ylim([ymin - pad, ymax + pad])
-    plt.tight_layout()
-    plt.savefig(gap_plot_path, dpi=150, bbox_inches="tight")
-    plt.close()
-    print(f"Saved gap plot to: {gap_plot_path}")
+    print(f"✓ Saved plot to: {plot_path}")
 
 
 if __name__ == "__main__":
