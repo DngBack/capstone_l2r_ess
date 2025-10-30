@@ -254,14 +254,21 @@ def train_ce_expert_paper():
     optimizer = optim.SGD(model.parameters(), lr=0.4, momentum=0.9, weight_decay=1e-4)
     
     # Learning rate schedule theo paper F.1
-    # Manual LR scheduling: warmup 15 steps, then epoch-based decays at 96, 192, 224
+    # Manual LR scheduling: warmup 15 EPOCHS (NOT iterations!), then epoch-based decays at 96, 192, 224
     def get_lr(epoch, iteration, total_iters_per_epoch):
-        """Manual LR scheduling theo paper specifications"""
-        global_iter = epoch * total_iters_per_epoch + iteration
+        """Manual LR scheduling theo paper specifications
         
-        # Warmup: 15 steps đầu với linear warmup
-        if global_iter < 15:
-            return 0.4 * (global_iter + 1) / 15
+        IMPORTANT: Paper says "15 steps" but in context of Table 3 where all other 
+        parameters are in epochs, this means 15 EPOCHS, not iterations!
+        - 15 iterations = 0.18 epochs (quá ngắn, không hợp lý)
+        - 15 epochs = hợp lý và phù hợp với warmup practices
+        """
+        warmup_epochs = 15
+        
+        # Warmup: 15 EPOCHS đầu với linear warmup
+        if epoch < warmup_epochs:
+            current_progress = (epoch * total_iters_per_epoch + iteration) / (warmup_epochs * total_iters_per_epoch)
+            return 0.4 * current_progress
         
         # Post-warmup: epoch-based decays
         lr = 0.4
@@ -284,7 +291,7 @@ def train_ce_expert_paper():
     print(f"   Model: ResNet-32")
     print(f"   Loss: CrossEntropyLoss")
     print(f"   Optimizer: SGD(lr=0.4, momentum=0.9, weight_decay=1e-4)")
-    print(f"   Scheduler: Warm-up + Decay at [96, 192, 224] epochs")
+    print(f"   Scheduler: Warm-up (15 EPOCHS) + Decay at [96, 192, 224] epochs")
     print(f"   Epochs: {epochs}")
     best_val_acc = 0.0
     train_losses = []
@@ -445,7 +452,7 @@ def train_ce_expert_paper():
         'model': 'ResNet-32',
         'loss': 'CrossEntropyLoss',
         'optimizer': 'SGD(lr=0.4, momentum=0.9, weight_decay=1e-4)',
-        'scheduler': 'Manual: Warmup(15 steps) + epoch decays at [96, 192, 224]',
+        'scheduler': 'Manual: Warmup(15 EPOCHS) + epoch decays at [96, 192, 224]',
         'epochs': epochs,
         'best_val_acc': best_val_acc,
         'final_test_acc': final_test_metrics['standard_acc'],
