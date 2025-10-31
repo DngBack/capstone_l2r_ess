@@ -49,3 +49,11 @@ python run_balanced_plugin_ce_only.py
 ```bash
 python run_worst_plugin_ce_only.py
 ```
+
+#### Note
+
+Run with only CE
+
+```
+python -m src.train.train_ce_expert_paper_final
+```

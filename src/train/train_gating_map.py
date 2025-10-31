@@ -33,27 +33,6 @@ from src.models.gating_losses import GatingLoss, compute_gating_metrics
 # ============================================================================
 
 
-def compute_group_inverse_weights(
-    labels: torch.Tensor, group_boundaries: List[int]
-) -> torch.Tensor:
-    """Compute inverse frequency weights per group (head/tail)."""
-    # Assign group for each sample
-    groups = torch.zeros_like(labels)
-    for i, boundary in enumerate(group_boundaries):
-        groups[labels >= boundary] = i + 1
-
-    num_groups = len(group_boundaries) + 1
-    group_counts = torch.bincount(groups.long(), minlength=num_groups).float()
-    group_freqs = group_counts / group_counts.sum()
-
-    # Inverse frequency weight
-    inv_freqs = 1.0 / (group_freqs + 1e-8)
-    sample_weights = inv_freqs[groups.long()]
-    sample_weights = sample_weights / sample_weights.mean()
-
-    return sample_weights
-
-
 def compute_responsibility_loss(posteriors, weights, labels, temperature=1.0):
     """Compute EM-style responsibility loss."""
     B, E, C = posteriors.shape
@@ -142,7 +121,6 @@ CONFIG = {
         "use_prior_reg": True,  # NEW: Group prior regularizer
         # Long-tail handling
         "use_class_weights": True,  # reweight loss theo tần suất
-        "use_inverse_freq_weights": True,  # NEW: inverse freq per group
         # Router temperature annealing
         "router_temp_start": 2.0,
         "router_temp_end": 0.7,
