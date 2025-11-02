@@ -197,6 +197,80 @@ class LoadBalancingLoss(nn.Module):
         return loss
 
 
+class GroupAwareLoadBalancingLoss(nn.Module):
+    """
+    Load-balance theo nhóm: ràng buộc E[w_e | G_k] (hoặc penalty) để 
+    LA/BS/CE nhận tải phù hợp Head/Tail.
+    
+    Ý tưởng (A): Không chỉ balance global, mà còn đảm bảo mỗi expert 
+    nhận đúng tải theo group (Head/Tail).
+    
+    References:
+    - Inspired by group fairness in MoE literature
+    """
+    
+    def __init__(self, alpha: float = 1e-2, lambda_group: float = 0.5):
+        """
+        Args:
+            alpha: global load-balancing coefficient
+            lambda_group: group-aware balancing coefficient
+        """
+        super().__init__()
+        self.alpha = alpha
+        self.lambda_group = lambda_group
+        self.base_lb = LoadBalancingLoss(alpha=alpha)
+    
+    def forward(
+        self,
+        weights: torch.Tensor,
+        group_membership: torch.Tensor,
+        num_groups: int = 2,
+        top_k: int = 1
+    ) -> Tuple[torch.Tensor, Dict[str, float]]:
+        """
+        Args:
+            weights: [B, E] gating weights
+            group_membership: [B] group ids (0 for head, 1 for tail, etc.)
+            num_groups: số groups
+            top_k: number of experts used
+        
+        Returns:
+            loss: scalar
+            metrics: dict
+        """
+        B, E = weights.shape
+        
+        # 1. Global load-balancing (base)
+        loss_global = self.base_lb(weights, top_k=top_k)
+        
+        # 2. Group-aware load-balancing
+        # Compute per-group, per-expert usage
+        group_expert_usage = torch.zeros(num_groups, E, device=weights.device)  # [G, E]
+        group_counts = torch.zeros(num_groups, device=weights.device)
+        
+        for g in range(num_groups):
+            mask = group_membership == g  # [B]
+            if mask.sum() > 0:
+                # Average expert weights for this group
+                group_expert_usage[g] = weights[mask].mean(dim=0)  # [E]
+                group_counts[g] = mask.float().sum()
+        
+        # Penalty: variance of expert usage across groups (should be balanced)
+        # For each expert, measure how uneven its usage is across groups
+        expert_usage_std = group_expert_usage.std(dim=0)  # [E]
+        loss_group = expert_usage_std.mean() * self.lambda_group
+        
+        total_loss = loss_global + loss_group
+        
+        metrics = {
+            'global_lb': loss_global.item(),
+            'group_lb': loss_group.item(),
+            'total_lb': total_loss.item()
+        }
+        
+        return total_loss, metrics
+
+
 # ============================================================================
 # 3. ENTROPY REGULARIZATION
 # ============================================================================
@@ -254,6 +328,126 @@ class EntropyRegularizer(nn.Module):
             loss = entropy.mean()
         
         return loss
+
+
+class AdaptiveEntropyRegularizer(nn.Module):
+    """
+    Adaptive entropy regularization based on expert disagreement.
+    
+    Ý tưởng (A): Khi disagreement cao (mixture-entropy ↑), ép entropy(w) ↓ 
+    (routing dứt khoát chọn specialist). Khi consensus (disagreement thấp), 
+    cho entropy(w) ↑ (an toàn trộn đều).
+    
+    Loss phụ: λ · corr(entropy(w), -disagreement) hoặc KL tới prior Dirichlet 
+    có nhiệt độ phụ thuộc disagreement.
+    
+    References:
+    - Malinin & Gales (2021): Uncertainty Estimation in Deep Learning
+    """
+    
+    def __init__(self, eps: float = 1e-8, num_experts: int = 3, 
+                 temperature_anneal: bool = True, use_kl: bool = True):
+        """
+        Args:
+            eps: numerical stability
+            num_experts: số experts
+            temperature_anneal: nếu True, sử dụng Dirichlet prior với temp
+            use_kl: nếu True, sử dụng KL-divergence thay vì correlation
+        """
+        super().__init__()
+        self.eps = eps
+        self.max_entropy = np.log(num_experts)
+        self.temperature_anneal = temperature_anneal
+        self.use_kl = use_kl
+    
+    def compute_disagreement(self, posteriors: torch.Tensor) -> torch.Tensor:
+        """
+        Compute expert disagreement metric.
+        
+        Args:
+            posteriors: [B, E, C]
+        
+        Returns:
+            disagreement: [B] (higher = more disagreement)
+        """
+        B, E, C = posteriors.shape
+        
+        # Mixture entropy as proxy for disagreement
+        uniform_mixture = posteriors.mean(dim=1)  # [B, C]
+        mixture_entropy = -torch.sum(
+            uniform_mixture * torch.log(uniform_mixture + self.eps),
+            dim=-1
+        )  # [B]
+        
+        # Normalize to [0, 1]
+        max_possible_entropy = np.log(C)
+        disagreement = mixture_entropy / max_possible_entropy
+        
+        return disagreement
+    
+    def forward(
+        self,
+        weights: torch.Tensor,
+        posteriors: Optional[torch.Tensor] = None,
+        disagreement: Optional[torch.Tensor] = None
+    ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+        """
+        Args:
+            weights: [B, E]
+            posteriors: [B, E, C] (optional, để compute disagreement)
+            disagreement: [B] (optional, nếu đã compute)
+        
+        Returns:
+            loss: scalar
+            metrics: dict với các metrics phụ
+        """
+        # Compute gating entropy
+        entropy_w = -torch.sum(weights * torch.log(weights + self.eps), dim=-1)  # [B]
+        
+        # Compute disagreement if not provided
+        if disagreement is None:
+            if posteriors is None:
+                # Fallback: uniform disagreement
+                disagreement = torch.zeros_like(entropy_w)
+            else:
+                disagreement = self.compute_disagreement(posteriors)
+        
+        if self.use_kl:
+            # Method 1: KL divergence to Dirichlet prior with disagreement-dependent temperature
+            if self.temperature_anneal:
+                # Temperature: high disagreement → low temp (sharp) → low entropy desired
+                # Low disagreement → high temp (flat) → high entropy desired
+                temperature = 1.0 + (1.0 - disagreement)  # [1, 2], reversed
+            else:
+                temperature = 1.0
+            
+            # Dirichlet prior parameters (uniform, scaled by temperature)
+            alpha = torch.ones_like(weights) * temperature.unsqueeze(-1)  # [B, E]
+            
+            # KL divergence (simplified, ignoring constants)
+            # KL(Dir(w | α)) = log Γ(Σα) - log Γ(α) + Σ(α-1)·(ψ(w) - ψ(Σα))
+            # Simplified: penalize when entropy(w) is misaligned with disagreement
+            target_entropy = self.max_entropy * disagreement
+            entropy_diff = (entropy_w - target_entropy).abs()
+            loss = entropy_diff.mean()
+            
+            method = "kl"
+        else:
+            # Method 2: Negative correlation penalty
+            # We want entropy(w) to correlate negatively with disagreement
+            # Loss = MSE từ ideal relationship
+            target_entropy = self.max_entropy * disagreement
+            loss = F.mse_loss(entropy_w, target_entropy)
+            method = "corr"
+        
+        metrics = {
+            'adaptive_entropy_loss': loss.item(),
+            'mean_gating_entropy': entropy_w.mean().item(),
+            'mean_disagreement': disagreement.mean().item(),
+            'method': method
+        }
+        
+        return loss, metrics
 
 
 # ============================================================================

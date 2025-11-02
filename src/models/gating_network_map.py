@@ -372,6 +372,117 @@ class NoisyTopKRouter(nn.Module):
         return weights
 
 
+class GumbelSoftmaxRouter(nn.Module):
+    """
+    Gumbel-Softmax / Top-1 routing mềm với nhiệt độ anneal.
+    
+    Ý tưởng (A): Tăng sắc nét w(x) nhưng vẫn vi phân được bằng Gumbel-Softmax trick.
+    
+    Algorithm:
+    1. Gumbel-Softmax với nhiệt độ τ (anneal từ cao → thấp trong training)
+    2. Khi τ → 0, gần như argmax (sharp); khi τ cao, gần uniform (smooth)
+    3. Backprop-able thay vì hard top-k
+    
+    Benefits:
+    - Differentiable như softmax
+    - Có thể anneal để tăng sharpness theo thời gian
+    - Tốt hơn hard top-k cho end-to-end training
+    
+    References:
+    - Jang et al. (2017): Categorical Reparameterization with Gumbel-Softmax
+    - Maddison et al. (2017): The Concrete Distribution
+    """
+    
+    def __init__(
+        self,
+        top_k: int = 1,
+        temperature: float = 1.0,
+        temperature_min: float = 0.5,
+        anneal_rate: float = 1e-5,
+        hard: bool = True,
+        straight_through: bool = False
+    ):
+        """
+        Args:
+            top_k: số experts chọn (thường 1 cho sparse routing)
+            temperature: nhiệt độ ban đầu (τ)
+            temperature_min: nhiệt độ tối thiểu khi anneal
+            anneal_rate: tốc độ anneal per update
+            hard: nếu True, dùng straight-through estimator
+            straight_through: nếu True, backward qua soft, forward qua hard
+        """
+        super().__init__()
+        self.top_k = top_k
+        self.temperature = temperature
+        self.temperature_min = temperature_min
+        self.anneal_rate = anneal_rate
+        self.hard = hard
+        self.straight_through = straight_through
+        
+        # Track current temperature (will be updated during training)
+        self._current_temp = temperature
+    
+    def forward(self, logits: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            logits: [B, E]
+        
+        Returns:
+            weights: [B, E] (soft sparse simplex)
+        """
+        B, E = logits.shape
+        
+        # Gumbel-Softmax sampling
+        if self.training:
+            # Sample from Gumbel distribution
+            gumbel_noise = -torch.log(-torch.log(torch.rand_like(logits) + 1e-8) + 1e-8)
+            gumbel_logits = (logits + gumbel_noise) / self._current_temp
+            
+            # Top-K: chỉ giữ top-k
+            if self.top_k < E:
+                topk_logits, topk_indices = torch.topk(gumbel_logits, k=self.top_k, dim=-1)
+                # Scatter back
+                gumbel_logits_sparse = torch.zeros_like(logits)
+                gumbel_logits_sparse.scatter_(dim=1, index=topk_indices, src=topk_logits)
+                gumbel_logits = gumbel_logits_sparse
+            
+            # Softmax
+            weights_soft = F.softmax(gumbel_logits, dim=-1)
+            
+            # Straight-through estimator (optional)
+            if self.hard:
+                # Hard assignment: set max to 1, others to 0
+                _, max_indices = weights_soft.max(dim=-1)
+                weights_hard = torch.zeros_like(weights_soft)
+                weights_hard.scatter_(1, max_indices.unsqueeze(1), 1.0)
+                
+                if self.straight_through:
+                    # Use hard for forward, soft for backward
+                    weights = weights_hard - weights_soft.detach() + weights_soft
+                else:
+                    weights = weights_hard
+            else:
+                weights = weights_soft
+        else:
+            # Inference: simple softmax over top-k
+            if self.top_k < E:
+                topk_logits, topk_indices = torch.topk(logits, k=self.top_k, dim=-1)
+                logits_sparse = torch.zeros_like(logits)
+                logits_sparse.scatter_(dim=1, index=topk_indices, src=topk_logits)
+                weights = F.softmax(logits_sparse / self._current_temp, dim=-1)
+            else:
+                weights = F.softmax(logits / self._current_temp, dim=-1)
+        
+        return weights
+    
+    def anneal_temperature(self):
+        """Anneals temperature for sharper routing."""
+        self._current_temp = max(
+            self.temperature_min,
+            self._current_temp * (1 - self.anneal_rate)
+        )
+
+
 # ============================================================================
 # COMPLETE GATING NETWORK
 # ============================================================================
@@ -425,6 +536,13 @@ class GatingNetwork(nn.Module):
             self.router = DenseSoftmaxRouter()
         elif routing == 'top_k':
             self.router = NoisyTopKRouter(top_k=top_k, noise_std=noise_std)
+        elif routing == 'gumbel':
+            self.router = GumbelSoftmaxRouter(
+                top_k=top_k,
+                temperature=1.0,
+                temperature_min=0.5,
+                anneal_rate=1e-5
+            )
         else:
             raise ValueError(f"Unknown routing: {routing}")
     

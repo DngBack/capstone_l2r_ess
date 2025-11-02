@@ -54,11 +54,51 @@ _Figure 2: Gating Weight Distribution Analysis - Weights by Group, Entropy/Margi
 
 _Figure 3: Oracle vs Uniform vs Gating Comparison - Accuracy, ECE, and NLL_
 
-Từ kết quả so sánh (`oracle_comparison.png`):
+**Giải thích về Oracle@E:**
+
+Oracle@E là một **upper bound lý thuyết** cho thấy hiệu suất tốt nhất có thể đạt được nếu ta có khả năng chọn expert tối ưu cho mỗi mẫu. Cụ thể:
+
+**Cách tính Oracle@E:**
+
+Với mỗi mẫu $x_i$ và nhãn thật $y_i$, Oracle chọn expert $e^*$ có xác suất đúng **cao nhất**:
+
+$$e^*(x_i) = \arg\max_{e=1..E} p^{(e)}(y_i | x_i)$$
+
+Posterior của Oracle là:
+
+$$\tilde{\eta}^{\text{oracle}}(x_i) = p^{(e^*(x_i))}(\cdot | x_i)$$
+
+**Tại sao Oracle có các giá trị này:**
+
+1. **Accuracy = 0.6811** (cao nhất trong 3 phương pháp):
+
+   - Oracle **luôn chọn expert tốt nhất** cho mỗi mẫu dựa trên nhãn thật
+   - Đây là **giới hạn trên** về accuracy mà bất kỳ routing strategy nào cũng không thể vượt qua
+   - So với Uniform-Mix (0.5567) và Gating-Mix (0.5589), Oracle cao hơn ~22%
+
+2. **ECE = 0.0353** (thấp nhất, calibration tốt nhất):
+
+   - Oracle chọn expert có confidence đúng cao nhất → predictions thường **calibrated tốt hơn**
+   - Gating-Mix (0.0582) gần với Oracle hơn Uniform-Mix (0.1026)
+   - Điều này cho thấy Gating đã cải thiện calibration, nhưng vẫn còn khoảng cách với Oracle
+
+3. **NLL = 1.088** (theo kết quả thực nghiệm, nếu có):
+   - NLL thấp vì Oracle chọn expert có xác suất đúng cao nhất cho mỗi mẫu
+   - Công thức: $\text{NLL} = -\frac{1}{N}\sum_{i=1}^{N} \log p(y_i | x_i)$
+   - Oracle có $\log p(y_i | x_i)$ cao hơn → NLL thấp hơn
+
+**Ý nghĩa của Oracle trong phân tích:**
+
+- Oracle không thể đạt được trong thực tế (vì ta không biết nhãn thật khi predict)
+- Oracle cho thấy **room for improvement**: khoảng cách giữa Gating (0.5589) và Oracle (0.6811) là **18.4%**
+- Nếu gating học tốt hơn, có thể tiến gần Oracle hơn
+- Oracle là **baseline để so sánh** với các phương pháp routing thực tế
+
+**Kết quả so sánh:**
 
 | Method          | Accuracy | ECE    | NLL   | Brier |
 | --------------- | -------- | ------ | ----- | ----- |
-| **Oracle@E**    | 0.6811   | 0.0353 | -     | -     |
+| **Oracle@E**    | 0.6811   | 0.0353 | 1.088 | -     |
 | **Uniform-Mix** | 0.5567   | 0.1026 | 1.668 | -     |
 | **Gating-Mix**  | 0.5589   | 0.0582 | 1.653 | -     |
 
@@ -66,14 +106,17 @@ Từ kết quả so sánh (`oracle_comparison.png`):
 
 1. **Accuracy**: Gating-Mix ≈ Uniform-Mix (0.5589 vs 0.5567) → gating chưa cải thiện accuracy đáng kể
 
+   - Còn xa Oracle (0.5589 vs 0.6811) → **room for improvement lớn**
+
 2. **Calibration (ECE)**: Gating-Mix **tốt hơn rõ** Uniform-Mix (0.0582 < 0.1026)
 
    - ECE thấp hơn ≈ **43%** so với Uniform
-   - Gần với Oracle (0.0582 vs 0.0353)
+   - Gần với Oracle (0.0582 vs 0.0353) → đã cải thiện calibration đáng kể
 
 3. **NLL (Negative Log Likelihood)**: Gating-Mix thấp hơn Uniform (1.653 < 1.668)
    - Công thức: $\text{NLL} = -\frac{1}{N}\sum_{i=1}^{N} \log p(y_i | x_i)$
    - NLL thấp hơn → mixture cung cấp xác suất **tin cậy hơn**
+   - Oracle (1.088) cho thấy còn có thể cải thiện thêm ~35%
 
 #### NLL Decomposition Analysis
 

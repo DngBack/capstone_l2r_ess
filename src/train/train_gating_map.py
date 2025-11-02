@@ -25,12 +25,77 @@ from typing import Dict, List, Tuple
 
 from src.models.gating_network_map import GatingNetwork, GatingMLP
 from src.models.gating import GatingFeatureBuilder
-from src.models.gating_losses import GatingLoss, compute_gating_metrics
+from src.models.gating_losses import (
+    GatingLoss, 
+    compute_gating_metrics,
+    AdaptiveEntropyRegularizer,
+    GroupAwareLoadBalancingLoss
+)
 
 
 # ============================================================================
 # IMPROVED LOSS FUNCTIONS
 # ============================================================================
+
+
+def compute_oracle_gating_labels(posteriors, labels, label_smoothing=0.1):
+    """
+    Teacher-gating (Oracle@E): Sinh "nhãn teacher" là best-expert per sample.
+    
+    Args:
+        posteriors: [B, E, C] expert posteriors
+        labels: [B] ground truth labels
+        label_smoothing: amount of label smoothing (0 = hard, 1 = uniform)
+    
+    Returns:
+        teacher_weights: [B, E] target gating weights
+    """
+    B, E, C = posteriors.shape
+    
+    # Oracle: best expert is one with highest prob for true class
+    expert_probs = posteriors[torch.arange(B), :, labels]  # [B, E]
+    best_expert = expert_probs.argmax(dim=-1)  # [B]
+    
+    # One-hot encoding
+    teacher_weights = torch.zeros(B, E, device=posteriors.device)
+    teacher_weights.scatter_(1, best_expert.unsqueeze(1), 1.0)  # [B, E]
+    
+    # Apply label smoothing
+    if label_smoothing > 0:
+        teacher_weights = (1 - label_smoothing) * teacher_weights + label_smoothing / E
+    
+    return teacher_weights
+
+
+def compute_teacher_gating_loss(pred_weights, teacher_weights, group_membership=None):
+    """
+    Cross-entropy loss cho gating predictions vs teacher labels.
+    
+    Args:
+        pred_weights: [B, E] predicted gating weights
+        teacher_weights: [B, E] teacher labels (from oracle)
+        group_membership: [B] optional group ids for reweighting
+    
+    Returns:
+        loss: scalar
+    """
+    # KL divergence (more stable than cross-entropy for softmax outputs)
+    loss = F.kl_div(
+        torch.log(pred_weights + 1e-8),
+        teacher_weights,
+        reduction='none'
+    ).sum(dim=-1)  # [B]
+    
+    # Optional: reweight by group (encourage correct expert for tail)
+    if group_membership is not None:
+        # Tail samples (group=1) should use LA/BS experts
+        tail_mask = group_membership == 1
+        # Increase weight for tail samples
+        group_weights = torch.ones_like(loss)
+        group_weights[tail_mask] = 1.5
+        loss = loss * group_weights
+    
+    return loss.mean()
 
 
 def compute_responsibility_loss(posteriors, weights, labels, temperature=1.0):
@@ -99,7 +164,7 @@ CONFIG = {
         "dropout": 0.1,
         "activation": "relu",
         # Routing
-        "routing": "dense",  # 'dense' or 'top_k'
+        "routing": "dense",  # 'dense', 'top_k', 'gumbel'
         "top_k": 2,
         "noise_std": 1.0,
         # Training
@@ -115,15 +180,28 @@ CONFIG = {
         "lambda_h": 0.01,  # entropy regularization
         "lambda_resp": 0.1,  # responsibility loss (EM-style)
         "lambda_prior": 0.05,  # prior regularizer (group-aware)
+        "lambda_adaptive_ent": 0.02,  # adaptive entropy (A)
+        "lambda_teacher": 0.5,  # teacher-gating loss (B)
+        "lambda_group_lb": 0.3,  # group-aware load balancing (A)
+        # Loss flags
         "use_load_balancing": True,
         "use_entropy_reg": True,
-        "use_responsibility": True,  # NEW: EM-style alignment
-        "use_prior_reg": True,  # NEW: Group prior regularizer
+        "use_responsibility": False,  # EM-style alignment
+        "use_prior_reg": False,  # Group prior regularizer
+        "use_adaptive_entropy": True,  # (A) Adaptive entropy
+        "use_teacher_gating": False,  # (B) Teacher-gating (Oracle@E)
+        "use_group_aware_lb": True,  # (A) Group-aware load balancing
         # Long-tail handling
         "use_class_weights": True,  # reweight loss theo tần suất
         # Router temperature annealing
         "router_temp_start": 2.0,
         "router_temp_end": 0.7,
+        # Gumbel routing
+        "gumbel_temp_start": 2.0,
+        "gumbel_temp_min": 0.5,
+        "gumbel_anneal_rate": 1e-5,
+        # Teacher-gating config
+        "teacher_label_smoothing": 0.1,
         # Validation
         "val_interval": 5,
     },
@@ -319,6 +397,8 @@ def train_one_epoch(
     group_priors: torch.Tensor = None,
     sample_weights: torch.Tensor = None,
     grad_clip: float = 1.0,
+    adaptive_ent_reg=None,
+    group_lb_loss=None,
 ) -> Dict[str, float]:
     """
     Train one epoch with improved losses.
@@ -335,17 +415,25 @@ def train_one_epoch(
         "entropy": 0.0,
         "responsibility": 0.0,
         "prior": 0.0,
+        "adaptive_entropy": 0.0,
+        "teacher_gating": 0.0,
+        "group_lb": 0.0,
     }
 
     all_weights = []
     all_posteriors = []
     all_targets = []
+    
+    gating_config = config["gating"]
 
     # Router temperature annealing
-    gating_config = config["gating"]
     router_temp = gating_config["router_temp_start"] - (
         gating_config["router_temp_start"] - gating_config["router_temp_end"]
     ) * (epoch / gating_config["epochs"])
+    
+    # Gumbel temperature annealing
+    if hasattr(model.router, 'anneal_temperature'):
+        model.router.anneal_temperature()
 
     # Prepare lightweight feature builder (reuse across batches)
     feature_builder = GatingFeatureBuilder()
@@ -399,6 +487,30 @@ def train_one_epoch(
 
             loss = loss + gating_config["lambda_prior"] * prior_loss
             components["prior"] = prior_loss.item()
+        
+        # Add adaptive entropy regularization (A)
+        if gating_config.get("use_adaptive_entropy", False) and adaptive_ent_reg is not None:
+            adaptive_loss, adaptive_metrics = adaptive_ent_reg(weights, posteriors)
+            loss = loss + gating_config["lambda_adaptive_ent"] * adaptive_loss
+            components["adaptive_entropy"] = adaptive_loss.item()
+        
+        # Add teacher-gating loss (B)
+        if gating_config.get("use_teacher_gating", False):
+            teacher_weights = compute_oracle_gating_labels(
+                posteriors, targets, gating_config.get("teacher_label_smoothing", 0.1)
+            )
+            teacher_loss = compute_teacher_gating_loss(weights, teacher_weights)
+            loss = loss + gating_config["lambda_teacher"] * teacher_loss
+            components["teacher_gating"] = teacher_loss.item()
+        
+        # Add group-aware load balancing (A)
+        if gating_config.get("use_group_aware_lb", False) and group_lb_loss is not None:
+            group_membership = (targets >= 50).long()  # 0=head, 1=tail
+            group_lb, group_metrics = group_lb_loss(
+                weights, group_membership, num_groups=2, top_k=gating_config.get("top_k", 1)
+            )
+            loss = loss + group_lb
+            components["group_lb"] = group_lb.item()
 
         # Backward
         optimizer.zero_grad()
@@ -614,6 +726,15 @@ def train_gating(config: Dict):
     print(f"   Load-balancing: {'✓' if use_lb else '✗ (disabled for dense routing)'}")
     print(f"   Entropy reg: {'✓' if config['gating']['use_entropy_reg'] else '✗'}")
     print(
+        f"   Adaptive entropy (A): {'✓' if config['gating'].get('use_adaptive_entropy', False) else '✗'}"
+    )
+    print(
+        f"   Teacher-gating (B): {'✓' if config['gating'].get('use_teacher_gating', False) else '✗'}"
+    )
+    print(
+        f"   Group-aware LB (A): {'✓' if config['gating'].get('use_group_aware_lb', False) else '✗'}"
+    )
+    print(
         f"   Responsibility loss: {'✓' if config['gating'].get('use_responsibility', False) else '✗'}"
     )
     print(
@@ -623,6 +744,12 @@ def train_gating(config: Dict):
         print(f"   λ_LB: {config['gating']['lambda_lb']}")
     if config["gating"]["use_entropy_reg"]:
         print(f"   λ_H: {config['gating']['lambda_h']}")
+    if config["gating"].get("use_adaptive_entropy", False):
+        print(f"   λ_Adaptive: {config['gating']['lambda_adaptive_ent']}")
+    if config["gating"].get("use_teacher_gating", False):
+        print(f"   λ_Teacher: {config['gating']['lambda_teacher']}")
+    if config["gating"].get("use_group_aware_lb", False):
+        print(f"   λ_GroupLB: {config['gating']['lambda_group_lb']}")
     if config["gating"].get("use_responsibility", False):
         print(f"   λ_Resp: {config['gating']['lambda_resp']}")
     if config["gating"].get("use_prior_reg", False):
@@ -703,6 +830,25 @@ def train_gating(config: Dict):
         print(
             f"   Router temp: {config['gating']['router_temp_start']:.1f} → {config['gating']['router_temp_end']:.1f}"
         )
+    
+    # Initialize auxiliary loss modules once
+    adaptive_ent_reg = None
+    if config["gating"].get("use_adaptive_entropy", False):
+        adaptive_ent_reg = AdaptiveEntropyRegularizer(
+            eps=1e-8,
+            num_experts=num_experts,
+            temperature_anneal=True,
+            use_kl=True
+        )
+        adaptive_ent_reg = adaptive_ent_reg.to(DEVICE)
+    
+    group_lb_loss_fn = None
+    if config["gating"].get("use_group_aware_lb", False):
+        group_lb_loss_fn = GroupAwareLoadBalancingLoss(
+            alpha=config["gating"]["lambda_lb"],
+            lambda_group=config["gating"]["lambda_group_lb"]
+        )
+        group_lb_loss_fn = group_lb_loss_fn.to(DEVICE)
 
     for epoch in range(config["gating"]["epochs"]):
         # Warmup LR
@@ -722,6 +868,8 @@ def train_gating(config: Dict):
             group_priors=group_priors,
             sample_weights=class_weights,
             grad_clip=1.0,
+            adaptive_ent_reg=adaptive_ent_reg,
+            group_lb_loss=group_lb_loss_fn,
         )
 
         # Scheduler
@@ -739,6 +887,12 @@ def train_gating(config: Dict):
             print(f"    [Resp={train_metrics['responsibility']:.4f}]", end="")
         if "prior" in train_metrics and train_metrics["prior"] > 0:
             print(f" [Prior={train_metrics['prior']:.4f}]", end="")
+        if "adaptive_entropy" in train_metrics and train_metrics["adaptive_entropy"] > 0:
+            print(f" [Adapt={train_metrics['adaptive_entropy']:.4f}]", end="")
+        if "teacher_gating" in train_metrics and train_metrics["teacher_gating"] > 0:
+            print(f" [Teach={train_metrics['teacher_gating']:.4f}]", end="")
+        if "group_lb" in train_metrics and train_metrics["group_lb"] > 0:
+            print(f" [GrpLB={train_metrics['group_lb']:.4f}]", end="")
         print(f" LR={current_lr:.6f}")
         print(
             f"  Mixture Acc: {train_metrics['mixture_acc']:.4f}, "
