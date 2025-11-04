@@ -5,11 +5,11 @@ from .backbones.resnet_cifar import CIFARResNet32
 
 class Expert(nn.Module):
     """
-    Expert model for CIFAR datasets using CIFARResNet-32 backbone.
+    Expert model for CIFAR and ImageNet/iNaturalist datasets.
     
-    This implementation uses a CIFAR-optimized ResNet-32 architecture
-    designed specifically for 32x32 images with proper initialization
-    and optional regularization.
+    Supports:
+    - CIFARResNet-32: For CIFAR-100-LT (32x32 images)
+    - ResNet-50: For ImageNet-LT and iNaturalist 2018 (224x224 images)
     """
     
     def __init__(self, num_classes=100, backbone_name='cifar_resnet32', 
@@ -25,14 +25,24 @@ class Expert(nn.Module):
             # Get feature dimension dynamically from backbone
             feature_dim = self.backbone.get_feature_dim()
             self.fc = nn.Linear(feature_dim, num_classes)
+        elif backbone_name == 'resnet50' or backbone_name == 'imagenet_resnet50':
+            import torchvision.models as models
+            # Load ResNet-50 from torchvision
+            self.backbone = models.resnet50(pretrained=False)
+            # Replace final classifier
+            feature_dim = self.backbone.fc.in_features
+            self.backbone.fc = nn.Identity()  # Remove default classifier
+            self.fc = nn.Linear(feature_dim, num_classes)
+            # Skip initialization (handled above) for ResNet-50
+            init_weights = False
         else:
             raise ValueError(f"Backbone '{backbone_name}' not recognized. "
-                        f"Supported: 'cifar_resnet32', 'resnet32'")
+                        f"Supported: 'cifar_resnet32', 'resnet32', 'resnet50', 'imagenet_resnet50'")
         
         # Temperature scaling parameter for calibration
         self.temperature = nn.Parameter(torch.ones(1), requires_grad=False)
         
-        # Initialize classifier if backbone init is enabled
+        # Initialize classifier if backbone init is enabled (only for CIFAR)
         if init_weights:
             self._initialize_classifier()
 

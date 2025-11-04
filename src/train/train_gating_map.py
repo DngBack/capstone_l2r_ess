@@ -13,6 +13,7 @@ Usage:
     python train_gating_map.py --routing top_k --top_k 2
 """
 
+import sys
 import torch
 import torch.nn.functional as F
 import torch.optim as optim
@@ -21,6 +22,7 @@ import numpy as np
 import json
 from pathlib import Path
 import argparse
+from datetime import datetime
 from typing import Dict, List, Tuple
 
 from src.models.gating_network_map import GatingNetwork, GatingMLP
@@ -81,6 +83,26 @@ def estimate_group_priors(posteriors, labels, group_boundaries):
 # ============================================================================
 # CONFIGURATION
 # ============================================================================
+
+# Dataset configurations for gating
+DATASET_CONFIGS_GATING = {
+    "cifar100_lt_if100": {
+        "name": "cifar100_lt_if100",
+        "splits_dir": "./data/cifar100_lt_if100_splits_fixed",
+        "logits_dir": "./outputs/logits/cifar100_lt_if100/",
+        "num_classes": 100,
+        "num_groups": 2,
+        "expert_names": ["ce_baseline", "logitadjust_baseline", "balsoftmax_baseline"],
+    },
+    "inaturalist2018": {
+        "name": "inaturalist2018",
+        "splits_dir": "./data/inaturalist2018_splits",
+        "logits_dir": "./outputs/logits/inaturalist2018/",
+        "num_classes": 8142,
+        "num_groups": 2,
+        "expert_names": ["ce_baseline", "logitadjust_baseline", "balsoftmax_baseline"],
+    }
+}
 
 CONFIG = {
     "dataset": {
@@ -189,12 +211,23 @@ def load_labels(splits_dir: str, split_name: str, device: str = "cpu") -> torch.
     """
     import torchvision
 
-    # Load indices
+    # Try to load from targets file first (for iNaturalist)
+    targets_file = f"{split_name}_targets.json"
+    targets_path = Path(splits_dir) / targets_file
+    
+    if targets_path.exists():
+        # Load targets directly from JSON (iNaturalist)
+        with open(targets_path, "r") as f:
+            targets = json.load(f)
+        labels = torch.tensor(targets, device=device, dtype=torch.long)
+        return labels
+
+    # Fallback to CIFAR logic (load from indices)
     indices_file = f"{split_name}_indices.json"
     indices_path = Path(splits_dir) / indices_file
 
     if not indices_path.exists():
-        raise FileNotFoundError(f"Indices not found: {indices_path}")
+        raise FileNotFoundError(f"Neither indices nor targets found: {splits_dir}")
 
     with open(indices_path, "r") as f:
         indices = json.load(f)
@@ -218,9 +251,14 @@ def load_labels(splits_dir: str, split_name: str, device: str = "cpu") -> torch.
     return labels
 
 
-def load_class_weights(splits_dir: str, device: str = "cpu") -> torch.Tensor:
+def load_class_weights(splits_dir: str, num_classes: int, device: str = "cpu") -> torch.Tensor:
     """
     Load class weights (frequency-based) cho reweighting.
+
+    Args:
+        splits_dir: Directory containing splits
+        num_classes: Number of classes
+        device: Device to load on
 
     Returns:
         weights: [C] tensor (normalized to sum=C)
@@ -229,7 +267,7 @@ def load_class_weights(splits_dir: str, device: str = "cpu") -> torch.Tensor:
 
     if not weights_path.exists():
         print("⚠️  class_weights.json not found, using uniform weights")
-        return torch.ones(100, device=device)
+        return torch.ones(num_classes, device=device)
 
     with open(weights_path, "r") as f:
         weights_data = json.load(f)
@@ -239,7 +277,7 @@ def load_class_weights(splits_dir: str, device: str = "cpu") -> torch.Tensor:
         weights = torch.tensor(weights_data, device=device)
     elif isinstance(weights_data, dict):
         weights = torch.tensor(
-            [weights_data[str(i)] for i in range(100)], device=device
+            [weights_data[str(i)] for i in range(num_classes)], device=device
         )
     else:
         raise ValueError(f"Unexpected format: {type(weights_data)}")
@@ -560,17 +598,19 @@ def train_gating(config: Dict):
     # Data
     train_loader, val_loader = create_dataloaders(config)
 
+    # Get num_classes first for class weights
+    num_classes = config["dataset"]["num_classes"]
+
     # Class weights (for loss reweighting)
     class_weights = None
     if config["gating"]["use_class_weights"]:
-        class_weights = load_class_weights(config["dataset"]["splits_dir"], DEVICE)
+        class_weights = load_class_weights(config["dataset"]["splits_dir"], num_classes, DEVICE)
         print(
             f"[OK] Loaded class weights (range: [{class_weights.min():.4f}, {class_weights.max():.4f}])"
         )
 
     # Model
     num_experts = len(config["experts"]["names"])
-    num_classes = config["dataset"]["num_classes"]
 
     print(f"\nCreating GatingNetwork:")
     print(f"   Experts: {num_experts}")
@@ -829,6 +869,13 @@ def train_gating(config: Dict):
 def main():
     parser = argparse.ArgumentParser(description="Train Gating Network for MAP")
     parser.add_argument(
+        "--dataset",
+        type=str,
+        default="cifar100_lt_if100",
+        choices=["cifar100_lt_if100", "inaturalist2018"],
+        help="Dataset name"
+    )
+    parser.add_argument(
         "--routing",
         type=str,
         default="dense",
@@ -847,10 +894,56 @@ def main():
     parser.add_argument(
         "--lambda_h", type=float, default=0.01, help="Entropy regularization weight"
     )
+    parser.add_argument(
+        "--log-file",
+        type=str,
+        default=None,
+        help="Path to log file. If provided, all output will be saved to this file"
+    )
 
     args = parser.parse_args()
 
-    # Update config
+    # Setup logging if log_file is provided
+    original_stdout = sys.stdout
+    log_file_handle = None
+    
+    if args.log_file:
+        log_path = Path(args.log_file)
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        log_file_handle = open(log_path, 'w', encoding='utf-8')
+        
+        # Create a class that writes to both stdout and log file
+        class TeeOutput:
+            def __init__(self, *files):
+                self.files = files
+            
+            def write(self, obj):
+                for f in self.files:
+                    f.write(obj)
+                    f.flush()
+            
+            def flush(self):
+                for f in self.files:
+                    f.flush()
+        
+        sys.stdout = TeeOutput(original_stdout, log_file_handle)
+        print(f"\n{'='*80}")
+        print(f"LOGGING TO FILE: {log_path}")
+        print(f"STARTED AT: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        print(f"{'='*80}\n")
+    
+    try:
+        # Update CONFIG based on dataset selection
+        dataset_config = DATASET_CONFIGS_GATING[args.dataset]
+        CONFIG["dataset"].update(dataset_config)
+        CONFIG["experts"]["names"] = dataset_config["expert_names"]
+        CONFIG["experts"]["logits_dir"] = dataset_config["logits_dir"]
+        
+        print(f"✓ Using dataset: {args.dataset}")
+        print(f"  Classes: {dataset_config['num_classes']}")
+        print(f"  Experts: {dataset_config['expert_names']}")
+
+        # Update config from arguments
     CONFIG["gating"]["routing"] = args.routing
     CONFIG["gating"]["top_k"] = args.top_k
     CONFIG["gating"]["epochs"] = args.epochs
@@ -863,6 +956,13 @@ def main():
     model, history = train_gating(CONFIG)
 
     print("\n🎉 Done!")
+    
+    finally:
+        # Restore stdout and close log file
+        if log_file_handle is not None:
+            sys.stdout = original_stdout
+            log_file_handle.close()
+            print(f"\n[Log saved to: {args.log_file}]")
 
 
 if __name__ == "__main__":

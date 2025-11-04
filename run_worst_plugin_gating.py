@@ -4,21 +4,26 @@ Worst-group Plug-in with Gating (3 Experts) per "Learning to Reject Meets Long-T
 =============================================================================================
 
 - Implements Algorithm 2 (Worst-group Plug-in) with inner Algorithm 1 (CS plug-in)
-- Uses mixture posteriors from a trained gating network combining 3 experts (CE, LogitAdjust, BalSoftmax)
+- Uses mixture posteriors from a trained gating network combining experts
 - Uses tunev (S1) for optimization and val (S2) for exponentiated-gradient updates
 - Evaluates on test; reports RC curves and AURC for worst-group (primary) and balanced (secondary)
 
+Usage:
+    python run_worst_plugin_gating.py --dataset cifar100_lt_if100
+    python run_worst_plugin_gating.py --dataset inaturalist2018
+
 Inputs (expected existing):
-- Splits dir: ./data/cifar100_lt_if100_splits_fixed/
-- Expert logits: ./outputs/logits/cifar100_lt_if100/{expert}/{split}_logits.pt
-- Gating checkpoint: ./checkpoints/gating_map/cifar100_lt_if100/final_gating.pth
-- Targets (if available): ./outputs/logits/cifar100_lt_if100/{expert}/{split}_targets.pt (optional)
+- Splits dir: ./data/{dataset_name}_splits/
+- Expert logits: ./outputs/logits/{dataset_name}/{expert}/{split}_logits.pt
+- Gating checkpoint: ./checkpoints/gating_map/{dataset_name}/final_gating.pth
+- Targets (if available): ./outputs/logits/{dataset_name}/{expert}/{split}_targets.pt (optional)
 
 Outputs:
-- results/ltr_plugin/cifar100_lt_if100/ltr_plugin_gating_worst.json
-- results/ltr_plugin/cifar100_lt_if100/ltr_rc_curves_balanced_worst_gating_test.png
+- results/ltr_plugin/{dataset_name}/ltr_plugin_gating_worst.json
+- results/ltr_plugin/{dataset_name}/ltr_rc_curves_balanced_worst_gating_test.png
 """
 
+import argparse
 import json
 from pathlib import Path
 from dataclasses import dataclass, field
@@ -68,8 +73,56 @@ class Config:
     seed: int = 42
 
 
-CFG = Config()
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+
+
+# Dataset configurations
+DATASET_CONFIGS = {
+    "cifar100_lt_if100": {
+        "splits_dir": "./data/cifar100_lt_if100_splits_fixed",
+        "logits_dir": "./outputs/logits/cifar100_lt_if100",
+        "gating_checkpoint": "./checkpoints/gating_map/cifar100_lt_if100/final_gating.pth",
+        "results_dir": "./results/ltr_plugin/cifar100_lt_if100",
+        "expert_names": ["ce_baseline", "logitadjust_baseline", "balsoftmax_baseline"],
+        "num_classes": 100,
+        "num_groups": 2,
+    },
+    "inaturalist2018": {
+        "splits_dir": "./data/inaturalist2018_splits",
+        "logits_dir": "./outputs/logits/inaturalist2018",
+        "gating_checkpoint": "./checkpoints/gating_map/inaturalist2018/final_gating.pth",
+        "results_dir": "./results/ltr_plugin/inaturalist2018",
+        "expert_names": ["ce_baseline", "logitadjust_baseline", "balsoftmax_baseline"],
+        "num_classes": 8142,
+        "num_groups": 2,
+    }
+}
+
+
+def setup_config(dataset_name: str) -> Config:
+    """Setup Config based on dataset selection."""
+    if dataset_name not in DATASET_CONFIGS:
+        raise ValueError(f"Unknown dataset: {dataset_name}. Choose from {list(DATASET_CONFIGS.keys())}")
+    
+    ds_config = DATASET_CONFIGS[dataset_name]
+    
+    # Create Config with dataset-specific settings
+    config = Config(
+        dataset_name=dataset_name,
+        splits_dir=ds_config["splits_dir"],
+        logits_dir=ds_config["logits_dir"],
+        gating_checkpoint=ds_config["gating_checkpoint"],
+        results_dir=ds_config["results_dir"],
+        expert_names=ds_config["expert_names"],
+        num_classes=ds_config["num_classes"],
+        num_groups=ds_config["num_groups"],
+    )
+    
+    return config
+
+
+# Default config (will be overridden by main)
+CFG = Config()
 
 
 def ensure_dirs():
@@ -97,6 +150,15 @@ def load_labels(split: str, device: str = DEVICE) -> torch.Tensor:
         t = torch.load(cand, map_location=device)
         if isinstance(t, torch.Tensor):
             return t.to(device=device, dtype=torch.long)
+    
+    # Fallback: load from JSON targets file (for iNaturalist) or CIFAR-style loading
+    targets_file = Path(CFG.splits_dir) / f"{split}_targets.json"
+    if targets_file.exists():
+        # iNaturalist: load targets from JSON
+        with open(targets_file, "r", encoding="utf-8") as f:
+            targets = json.load(f)
+        return torch.tensor(targets, dtype=torch.long, device=device)
+    
     import torchvision
 
     indices_file = Path(CFG.splits_dir) / f"{split}_indices.json"
@@ -673,4 +735,66 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    import sys
+    from datetime import datetime
+    
+    parser = argparse.ArgumentParser(description="Worst-group L2R Plugin with Gating")
+    parser.add_argument(
+        "--dataset",
+        type=str,
+        default="cifar100_lt_if100",
+        choices=["cifar100_lt_if100", "inaturalist2018"],
+        help="Dataset name"
+    )
+    parser.add_argument(
+        "--log-file",
+        type=str,
+        default=None,
+        help="Path to log file. If provided, all output will be saved to this file"
+    )
+    args = parser.parse_args()
+    
+    # Setup logging if log_file is provided
+    original_stdout = sys.stdout
+    log_file_handle = None
+    
+    if args.log_file:
+        log_path = Path(args.log_file)
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        log_file_handle = open(log_path, 'w', encoding='utf-8')
+        
+        # Create a class that writes to both stdout and log file
+        class TeeOutput:
+            def __init__(self, *files):
+                self.files = files
+            
+            def write(self, obj):
+                for f in self.files:
+                    f.write(obj)
+                    f.flush()
+            
+            def flush(self):
+                for f in self.files:
+                    f.flush()
+        
+        sys.stdout = TeeOutput(original_stdout, log_file_handle)
+        print(f"\n{'='*80}")
+        print(f"LOGGING TO FILE: {log_path}")
+        print(f"STARTED AT: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        print(f"{'='*80}\n")
+    
+    try:
+        # Setup config based on dataset
+        CFG = setup_config(args.dataset)
+        
+        print(f"✓ Using dataset: {args.dataset}")
+        print(f"  Classes: {CFG.num_classes}")
+        print(f"  Experts: {CFG.expert_names}")
+        
+        main()
+    finally:
+        # Restore stdout and close log file
+        if log_file_handle is not None:
+            sys.stdout = original_stdout
+            log_file_handle.close()
+            print(f"\n[Log saved to: {args.log_file}]")
