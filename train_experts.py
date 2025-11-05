@@ -175,8 +175,13 @@ def train_single_expert_wrapper(expert_key, args):
         
         if args.verbose:
             print(f"\n📋 Training configuration for {expert_key}:")
-            from src.train.train_expert import EXPERT_CONFIGS
-            config = EXPERT_CONFIGS[expert_key]
+            from src.train.train_expert import EXPERT_CONFIGS, EXPERT_CONFIGS_INATURALIST
+            # Select configs based on dataset
+            if args.dataset == 'inaturalist2018':
+                expert_configs = EXPERT_CONFIGS_INATURALIST
+            else:
+                expert_configs = EXPERT_CONFIGS
+            config = expert_configs[expert_key]
             for key, value in config.items():
                 print(f"  {key}: {value}")
             print(f"  use_expert_split: {use_expert_split}")
@@ -184,7 +189,8 @@ def train_single_expert_wrapper(expert_key, args):
         if args.dry_run:
             print(f"🔍 [DRY RUN] Would train expert: {expert_key}")
             print(f"    Using {'expert split (90% train)' if use_expert_split else 'full train'}")
-            return f"checkpoints/experts/cifar100_lt_if100/{expert_key}_model.pth"
+            dataset_name = args.dataset if hasattr(args, 'dataset') and args.dataset else 'cifar100_lt_if100'
+            return f"checkpoints/experts/{dataset_name}/{expert_key}_model.pth"
         
         model_path = train_single_expert(
             expert_key, 
@@ -231,32 +237,38 @@ def main():
         print(f"{'='*80}\n")
     
     try:
-    print("=" * 60)
-    print("AR-GSE EXPERT TRAINING")
-    print("=" * 60)
-    
-    # Determine split usage
-    use_expert_split = not args.use_full_train
-    if use_expert_split:
-        print("📊 Training Mode: Using EXPERT split (90% of train)")
-        print("   - Trains on 9,719 samples (expert split)")
-        print("   - Validates on 1,000 samples (balanced val)")
-        print("   - Uses reweighted metrics for validation")
-    else:
-        print("📊 Training Mode: Using FULL train set")
-        print("   - Trains on 10,847 samples (full train)")
-        print("   - Validates on 1,000 samples (balanced val)")
-        print("   - Uses reweighted metrics for validation")
-    print()
-    
-    # Setup environment
-    setup_training_environment(args)
-    
-        from src.train.train_expert import EXPERT_CONFIGS
+        print("=" * 60)
+        print("AR-GSE EXPERT TRAINING")
+        print("=" * 60)
+        
+        # Determine split usage
+        use_expert_split = not args.use_full_train
+        if use_expert_split:
+            print("📊 Training Mode: Using EXPERT split (90% of train)")
+            print("   - Trains on 9,719 samples (expert split)")
+            print("   - Validates on 1,000 samples (balanced val)")
+            print("   - Uses reweighted metrics for validation")
+        else:
+            print("📊 Training Mode: Using FULL train set")
+            print("   - Trains on 10,847 samples (full train)")
+            print("   - Validates on 1,000 samples (balanced val)")
+            print("   - Uses reweighted metrics for validation")
+        print()
+        
+        # Setup environment
+        setup_training_environment(args)
+        
+        from src.train.train_expert import EXPERT_CONFIGS, EXPERT_CONFIGS_INATURALIST
+        
+        # Select configs based on dataset
+        if args.dataset == 'inaturalist2018':
+            expert_configs = EXPERT_CONFIGS_INATURALIST
+        else:
+            expert_configs = EXPERT_CONFIGS
         
         # Determine which experts to train
         if args.expert == 'all':
-            experts_to_train = list(EXPERT_CONFIGS.keys())
+            experts_to_train = list(expert_configs.keys())
         else:
             experts_to_train = [args.expert]
         
