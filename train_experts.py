@@ -175,13 +175,8 @@ def train_single_expert_wrapper(expert_key, args):
         
         if args.verbose:
             print(f"\n📋 Training configuration for {expert_key}:")
-            from src.train.train_expert import EXPERT_CONFIGS, EXPERT_CONFIGS_INATURALIST
-            # Select configs based on dataset
-            if args.dataset == 'inaturalist2018':
-                expert_configs = EXPERT_CONFIGS_INATURALIST
-            else:
-                expert_configs = EXPERT_CONFIGS
-            config = expert_configs[expert_key]
+            from src.train.train_expert import EXPERT_CONFIGS
+            config = EXPERT_CONFIGS[expert_key]
             for key, value in config.items():
                 print(f"  {key}: {value}")
             print(f"  use_expert_split: {use_expert_split}")
@@ -189,8 +184,7 @@ def train_single_expert_wrapper(expert_key, args):
         if args.dry_run:
             print(f"🔍 [DRY RUN] Would train expert: {expert_key}")
             print(f"    Using {'expert split (90% train)' if use_expert_split else 'full train'}")
-            dataset_name = args.dataset if hasattr(args, 'dataset') and args.dataset else 'cifar100_lt_if100'
-            return f"checkpoints/experts/{dataset_name}/{expert_key}_model.pth"
+            return f"checkpoints/experts/cifar100_lt_if100/{expert_key}_model.pth"
         
         model_path = train_single_expert(
             expert_key, 
@@ -258,17 +252,11 @@ def main():
         # Setup environment
         setup_training_environment(args)
         
-        from src.train.train_expert import EXPERT_CONFIGS, EXPERT_CONFIGS_INATURALIST
-        
-        # Select configs based on dataset
-        if args.dataset == 'inaturalist2018':
-            expert_configs = EXPERT_CONFIGS_INATURALIST
-        else:
-            expert_configs = EXPERT_CONFIGS
+        from src.train.train_expert import EXPERT_CONFIGS
         
         # Determine which experts to train
         if args.expert == 'all':
-            experts_to_train = list(expert_configs.keys())
+            experts_to_train = list(EXPERT_CONFIGS.keys())
         else:
             experts_to_train = [args.expert]
         
@@ -330,7 +318,7 @@ def main():
             print("\n❌ No experts were trained successfully")
             print("Please check the errors above and resolve any issues")
             sys.exit(1)
-            
+        
         if args.log_file:
             print(f"\n{'='*80}")
             print(f"COMPLETED AT: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
