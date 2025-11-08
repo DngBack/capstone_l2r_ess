@@ -128,7 +128,6 @@ def load_class_weights(device: str = DEVICE) -> torch.Tensor:
     # CORRECTED: Calculate inverse weights to re-weight test set to training distribution
     # Test set is balanced (1/num_classes per class), training set is long-tail
     train_probs = counts / total_train
-    test_probs = np.ones(CFG.num_classes) / CFG.num_classes  # Balanced test set
 
     # Importance weights = train_probs / test_probs = train_probs * num_classes
     # This up-weights head classes and down-weights tail classes

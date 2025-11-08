@@ -15,6 +15,7 @@ from src.models.experts import Expert
 from src.models.losses import LogitAdjustLoss, BalancedSoftmaxLoss
 from src.metrics.calibration import TemperatureScaler
 from src.data.dataloader_utils import get_expert_training_dataloaders
+from src.data.groups import get_class_to_group_by_threshold
 
 # Import paper-compliant metrics (optional, for extended evaluation)
 # These functions are available from src.train.train_utils:
@@ -169,7 +170,54 @@ def load_class_weights(splits_dir):
     return weights
 
 
-def validate_model(model, val_loader, device, class_weights=None):
+def load_class_counts(splits_dir):
+    """Load class counts from training distribution."""
+    counts_path = Path(splits_dir) / "train_class_counts.json"
+
+    if not counts_path.exists():
+        raise FileNotFoundError(
+            f"train_class_counts.json not found in {splits_dir}. "
+            "Please ensure dataset splits have been created."
+        )
+
+    with open(counts_path, "r") as f:
+        counts_data = json.load(f)
+
+    # Handle both list and dict formats
+    if isinstance(counts_data, list):
+        class_counts = counts_data
+    elif isinstance(counts_data, dict):
+        class_counts = [counts_data[str(i)] for i in range(100)]
+    else:
+        raise ValueError(f"Unexpected format for class counts: {type(counts_data)}")
+
+    return class_counts
+
+
+def build_class_to_group(splits_dir, threshold=20):
+    """
+    Build class-to-group mapping using threshold-based method (paper-compliant).
+
+    Args:
+        splits_dir: Directory containing train_class_counts.json
+        threshold: Sample count threshold (default=20, as per paper)
+
+    Returns:
+        class_to_group: Tensor mapping class indices to groups (0=head, 1=tail)
+    """
+    class_counts = load_class_counts(splits_dir)
+    class_to_group = get_class_to_group_by_threshold(class_counts, threshold=threshold)
+
+    num_head = (class_to_group == 0).sum().item()
+    num_tail = (class_to_group == 1).sum().item()
+    print(
+        f"  Groups (threshold={threshold}): Head={num_head} classes, Tail={num_tail} classes"
+    )
+
+    return class_to_group
+
+
+def validate_model(model, val_loader, device, class_weights=None, class_to_group=None):
     """
     Validate model with reweighted metrics.
 
@@ -178,6 +226,8 @@ def validate_model(model, val_loader, device, class_weights=None):
         val_loader: Validation dataloader (balanced val split)
         device: Device to use
         class_weights: Class weights for reweighting (from training distribution)
+        class_to_group: Tensor mapping class indices to groups (0=head, 1=tail)
+                       If None, falls back to index-based (0-49=head, 50-99=tail)
 
     Returns:
         overall_acc: Overall accuracy (unweighted, on balanced val)
@@ -194,6 +244,10 @@ def validate_model(model, val_loader, device, class_weights=None):
 
     group_correct = {"head": 0, "tail": 0}
     group_total = {"head": 0, "tail": 0}
+
+    # Move class_to_group to device if provided
+    if class_to_group is not None:
+        class_to_group = class_to_group.to(device)
 
     with torch.no_grad():
         for inputs, targets in val_loader:
@@ -213,15 +267,18 @@ def validate_model(model, val_loader, device, class_weights=None):
                 if pred == target_class:
                     class_correct[target_class] += 1
 
-                # Group-wise accuracy (Head: 0-49, Tail: 50-99)
-                if target_class < 50:  # Head classes
-                    group_total["head"] += 1
-                    if pred == target_class:
-                        group_correct["head"] += 1
-                else:  # Tail classes
-                    group_total["tail"] += 1
-                    if pred == target_class:
-                        group_correct["tail"] += 1
+                # Group-wise accuracy using threshold-based mapping (paper-compliant)
+                if class_to_group is not None:
+                    # Use threshold-based grouping (paper method)
+                    group_id = class_to_group[target_class].item()
+                    group_name = "head" if group_id == 0 else "tail"
+                else:
+                    # Fallback to index-based grouping (legacy)
+                    group_name = "head" if target_class < 50 else "tail"
+
+                group_total[group_name] += 1
+                if pred == target_class:
+                    group_correct[group_name] += 1
 
     # Standard accuracy (on balanced val set)
     overall_acc = 100 * correct / total
@@ -435,6 +492,10 @@ def train_single_expert(expert_key, use_expert_split=True):
     class_weights = load_class_weights(CONFIG["dataset"]["splits_dir"])
     print("[SUCCESS] Loaded class weights for reweighted validation")
 
+    # Build class-to-group mapping using threshold-based method (paper-compliant)
+    class_to_group = build_class_to_group(CONFIG["dataset"]["splits_dir"], threshold=20)
+    print("[SUCCESS] Built class-to-group mapping (threshold-based)")
+
     # Training setup
     best_reweighted_acc = 0.0
     checkpoint_dir = (
@@ -482,7 +543,11 @@ def train_single_expert(expert_key, use_expert_split=True):
 
         # Validate with reweighting
         val_acc, reweighted_acc, group_accs = validate_model(
-            model, val_loader, DEVICE, class_weights=class_weights
+            model,
+            val_loader,
+            DEVICE,
+            class_weights=class_weights,
+            class_to_group=class_to_group,
         )
 
         # Get current LR
@@ -524,7 +589,11 @@ def train_single_expert(expert_key, use_expert_split=True):
 
     # Final validation with reweighting
     final_acc, final_reweighted_acc, final_group_accs = validate_model(
-        model, val_loader, DEVICE, class_weights=class_weights
+        model,
+        val_loader,
+        DEVICE,
+        class_weights=class_weights,
+        class_to_group=class_to_group,
     )
     print("📊 Final Results:")
     print(f"   Overall Acc: {final_acc:.2f}% (on balanced val)")

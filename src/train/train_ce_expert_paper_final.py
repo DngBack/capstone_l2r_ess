@@ -11,7 +11,6 @@ import torchvision
 import torchvision.transforms as transforms
 from torch.utils.data import Subset, DataLoader
 import numpy as np
-import os
 import json
 import matplotlib.pyplot as plt
 from tqdm import tqdm
@@ -169,10 +168,16 @@ def get_cifar100_lt_dataloaders_paper(
 
     # Load original CIFAR-100
     cifar_train = torchvision.datasets.CIFAR100(
-        root=str(project_root / "data"), train=True, download=True, transform=transform_train
+        root=str(project_root / "data"),
+        train=True,
+        download=True,
+        transform=transform_train,
     )
     cifar_test = torchvision.datasets.CIFAR100(
-        root=str(project_root / "data"), train=False, download=True, transform=transform_test
+        root=str(project_root / "data"),
+        train=False,
+        download=True,
+        transform=transform_test,
     )
 
     # Create long-tail train set
@@ -613,7 +618,9 @@ def train_ce_expert_paper():
     test_targets = torch.cat(test_targets, dim=0)
 
     # Save logits
-    output_dir = project_root / "outputs" / "logits" / "cifar100_lt_if100" / "ce_baseline"
+    output_dir = (
+        project_root / "outputs" / "logits" / "cifar100_lt_if100" / "ce_baseline"
+    )
     output_dir.mkdir(parents=True, exist_ok=True)
 
     torch.save(test_logits, output_dir / "test_logits.pt")
@@ -741,4 +748,3 @@ if __name__ == "__main__":
 
     # Tiếp tục train như cũ
     train_ce_expert_paper()
-
