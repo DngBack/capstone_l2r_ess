@@ -157,24 +157,27 @@ def analyze_inaturalist_distribution(
     print(f"  Q75 (75th percentile): {q75:.1f}")
     print(f"  Imbalance Ratio (max/min): {imbalance_ratio:,.1f}x")
     
-    # Head/Tail analysis
+    # Head/Tail analysis - IMPORTANT: Use TRAIN counts (not total_counts) for head/tail classification
+    # This ensures consistency: a class that is head on train is head on val/test/tunev as well
     threshold = 20
-    head_classes = [cls for cls, count in total_counts.items() if count > threshold]
-    tail_classes = [cls for cls, count in total_counts.items() if count <= threshold]
+    head_classes = [cls for cls, count in train_counts.items() if count > threshold]
+    tail_classes = [cls for cls, count in train_counts.items() if count <= threshold]
     
     print(f"\n{'='*80}")
-    print(f"HEAD/TAIL CLASSIFICATION (threshold = {threshold} samples)")
+    print(f"HEAD/TAIL CLASSIFICATION (threshold = {threshold} samples in TRAIN set)")
     print(f"{'='*80}")
-    print(f"Head classes (> {threshold} samples): {len(head_classes):,} ({100*len(head_classes)/num_classes:.1f}%)")
-    print(f"Tail classes (≤ {threshold} samples): {len(tail_classes):,} ({100*len(tail_classes)/num_classes:.1f}%)")
+    print(f"IMPORTANT: Head/tail classification is based on TRAIN counts, not total counts")
+    print(f"  This ensures consistency across all splits (val/test/tunev use same head/tail definition)")
+    print(f"Head classes (> {threshold} train samples): {len(head_classes):,} ({100*len(head_classes)/num_classes:.1f}%)")
+    print(f"Tail classes (≤ {threshold} train samples): {len(tail_classes):,} ({100*len(tail_classes)/num_classes:.1f}%)")
     
     if len(head_classes) > 0:
-        head_counts = [total_counts[cls] for cls in head_classes]
-        tail_counts = [total_counts[cls] for cls in tail_classes]
-        print(f"\nHead class stats:")
-        print(f"  Min: {min(head_counts)}, Max: {max(head_counts):,}, Mean: {np.mean(head_counts):.1f}")
-        print(f"Tail class stats:")
-        print(f"  Min: {min(tail_counts)}, Max: {max(tail_counts)}, Mean: {np.mean(tail_counts):.1f}")
+        head_train_counts = [train_counts[cls] for cls in head_classes]
+        tail_train_counts = [train_counts[cls] for cls in tail_classes]
+        print(f"\nHead class stats (train samples):")
+        print(f"  Min: {min(head_train_counts)}, Max: {max(head_train_counts):,}, Mean: {np.mean(head_train_counts):.1f}")
+        print(f"Tail class stats (train samples):")
+        print(f"  Min: {min(tail_train_counts)}, Max: {max(tail_train_counts)}, Mean: {np.mean(tail_train_counts):.1f}")
     
     # Visualize last N tail classes (classes with least samples)
     sorted_classes = sorted(total_counts.items(), key=lambda x: x[1])
@@ -744,6 +747,25 @@ def save_splits_to_json(splits_dict: Dict, output_dir: str):
     output_path.mkdir(parents=True, exist_ok=True)
     
     print(f"\nSaving splits to: {output_dir}")
+    
+    # Save class_to_group mapping if train_class_counts is available
+    if 'train_class_counts' in splits_dict:
+        train_counts = splits_dict['train_class_counts']
+        threshold = 20
+        class_to_group = []
+        for i, count in enumerate(train_counts):
+            # 0 = head, 1 = tail (based on train counts)
+            group = 1 if count <= threshold else 0
+            class_to_group.append(group)
+        
+        group_path = output_path / "class_to_group.json"
+        with open(group_path, 'w') as f:
+            json.dump(class_to_group, f, indent=2)
+        
+        num_head = sum(1 for g in class_to_group if g == 0)
+        num_tail = sum(1 for g in class_to_group if g == 1)
+        print(f"  - class_to_group.json ({len(class_to_group):,} classes: {num_head} head, {num_tail} tail)")
+        print(f"    (Head/tail classification based on train counts, threshold = {threshold})")
     
     for split_name, data in splits_dict.items():
         filepath = output_path / f"{split_name}.json"

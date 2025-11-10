@@ -37,6 +37,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import matplotlib.pyplot as plt
+import pandas as pd
 
 
 # ================================
@@ -115,6 +116,18 @@ DATASET_CONFIGS = {
         "expert_names": ["ce_baseline", "logitadjust_baseline", "balsoftmax_baseline"],
         "num_classes": 8142,
         "num_groups": 2,
+    },
+    "imagenet_lt": {
+        "splits_dir": "./data/imagenet_lt_splits",
+        "logits_dir": "./outputs/logits/imagenet_lt",
+        "gating_checkpoint": "./checkpoints/gating_map/imagenet_lt/final_gating.pth",
+        "results_dir": "./results/ltr_plugin/imagenet_lt",
+        "expert_names": ["ce_baseline", "logitadjust_baseline", "balsoftmax_baseline"],
+        "num_classes": 1000,
+        "num_groups": 2,
+        "data_dir": "./data/imagenet_lt",
+        "train_label_file": "ImageNet_LT_train.txt",
+        "val_label_file": "ImageNet_LT_test.txt",
     }
 }
 
@@ -181,10 +194,10 @@ def load_labels(split: str, device: str = DEVICE) -> torch.Tensor:
         if isinstance(t, torch.Tensor):
             return t.to(device=device, dtype=torch.long)
 
-    # Fallback: load from JSON targets file (for iNaturalist) or CIFAR-style loading
+    # Fallback: load from JSON targets file (for iNaturalist/ImageNet-LT) or CIFAR-style loading
     targets_file = Path(CFG.splits_dir) / f"{split}_targets.json"
     if targets_file.exists():
-        # iNaturalist: load targets from JSON
+        # iNaturalist/ImageNet-LT: load targets from JSON
         with open(targets_file, "r", encoding="utf-8") as f:
             targets = json.load(f)
         return torch.tensor(targets, dtype=torch.long, device=device)
@@ -711,9 +724,25 @@ def main():
     print("Loading S1 (tunev) and S2 (val) for selection/evaluation...")
     expert_logits_tunev = load_expert_logits(CFG.expert_names, "tunev", DEVICE)
     labels_tunev = load_labels("tunev", DEVICE)
+    
+    # Validate sizes match for tunev
+    if expert_logits_tunev.shape[0] != labels_tunev.shape[0]:
+        print(f"⚠️  WARNING: Size mismatch for tunev! Logits: {expert_logits_tunev.shape[0]}, Labels: {labels_tunev.shape[0]}")
+        min_size = min(expert_logits_tunev.shape[0], labels_tunev.shape[0])
+        print(f"    Truncating to {min_size} samples")
+        expert_logits_tunev = expert_logits_tunev[:min_size]
+        labels_tunev = labels_tunev[:min_size]
 
     expert_logits_val = load_expert_logits(CFG.expert_names, "val", DEVICE)
     labels_val = load_labels("val", DEVICE)
+    
+    # Validate sizes match for val
+    if expert_logits_val.shape[0] != labels_val.shape[0]:
+        print(f"⚠️  WARNING: Size mismatch for val! Logits: {expert_logits_val.shape[0]}, Labels: {labels_val.shape[0]}")
+        min_size = min(expert_logits_val.shape[0], labels_val.shape[0])
+        print(f"    Truncating to {min_size} samples")
+        expert_logits_val = expert_logits_val[:min_size]
+        labels_val = labels_val[:min_size]
 
     print("Computing mixture posteriors using gating network...")
     posterior_tunev = compute_mixture_posterior(expert_logits_tunev, gating, DEVICE)
@@ -728,6 +757,15 @@ def main():
     # Check baseline balanced error on test set
     expert_logits_test = load_expert_logits(CFG.expert_names, "test", DEVICE)
     labels_test = load_labels("test", DEVICE)
+    
+    # Validate sizes match
+    if expert_logits_test.shape[0] != labels_test.shape[0]:
+        print(f"⚠️  WARNING: Size mismatch! Logits: {expert_logits_test.shape[0]}, Labels: {labels_test.shape[0]}")
+        min_size = min(expert_logits_test.shape[0], labels_test.shape[0])
+        print(f"    Truncating to {min_size} samples")
+        expert_logits_test = expert_logits_test[:min_size]
+        labels_test = labels_test[:min_size]
+    
     posterior_test = compute_mixture_posterior(expert_logits_test, gating, DEVICE)
 
     # Compute baseline balanced error (no rejection) with importance weighting
@@ -1109,6 +1147,36 @@ def main():
     with open(out_json, "w", encoding="utf-8") as f:
         json.dump(save_dict, f, indent=2)
     print(f"Saved results to: {out_json}")
+    
+    # Export CSV for easy tracking
+    csv_data = []
+    for r in results_per_cost:
+        csv_data.append({
+            'target_rejection': r['target_rejection'],
+            'val_balanced_error': r['val_metrics']['balanced_error'],
+            'val_worst_group_error': r['val_metrics']['worst_group_error'],
+            'val_coverage': r['val_metrics']['coverage'],
+            'val_head_error': r['val_metrics']['group_errors'][0] if len(r['val_metrics']['group_errors']) >= 2 else None,
+            'val_tail_error': r['val_metrics']['group_errors'][1] if len(r['val_metrics']['group_errors']) >= 2 else None,
+            'val_tail_minus_head': r['val_metrics']['group_errors'][1] - r['val_metrics']['group_errors'][0] if len(r['val_metrics']['group_errors']) >= 2 else None,
+            'test_balanced_error': r['test_metrics']['balanced_error'],
+            'test_worst_group_error': r['test_metrics']['worst_group_error'],
+            'test_coverage': r['test_metrics']['coverage'],
+            'test_head_error': r['test_metrics']['group_errors'][0] if len(r['test_metrics']['group_errors']) >= 2 else None,
+            'test_tail_error': r['test_metrics']['group_errors'][1] if len(r['test_metrics']['group_errors']) >= 2 else None,
+            'test_tail_minus_head': r['test_metrics']['group_errors'][1] - r['test_metrics']['group_errors'][0] if len(r['test_metrics']['group_errors']) >= 2 else None,
+            'alpha_head': r['alpha'][0] if len(r['alpha']) >= 2 else None,
+            'alpha_tail': r['alpha'][1] if len(r['alpha']) >= 2 else None,
+            'mu_head': r['mu'][0] if len(r['mu']) >= 2 else None,
+            'mu_tail': r['mu'][1] if len(r['mu']) >= 2 else None,
+            'cost_val': r['cost_val'],
+            'cost_test': r['cost_test'],
+        })
+    
+    df = pd.DataFrame(csv_data)
+    csv_path = Path(CFG.results_dir) / "ltr_plugin_gating_balanced.csv"
+    df.to_csv(csv_path, index=False)
+    print(f"Saved CSV results to: {csv_path}")
 
     # Print AURCs
     print(f"Val AURC - Balanced: {aurc_val_bal:.4f} | Worst-group: {aurc_val_wst:.4f}")
@@ -1157,7 +1225,7 @@ if __name__ == "__main__":
         "--dataset",
         type=str,
         default="cifar100_lt_if100",
-        choices=["cifar100_lt_if100", "inaturalist2018"],
+        choices=["cifar100_lt_if100", "inaturalist2018", "imagenet_lt"],
         help="Dataset name"
     )
     parser.add_argument(

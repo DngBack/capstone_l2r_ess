@@ -101,7 +101,15 @@ DATASET_CONFIGS_GATING = {
         "num_classes": 8142,
         "num_groups": 2,
         "expert_names": ["ce_baseline", "logitadjust_baseline", "balsoftmax_baseline"],
-    }
+    },
+    "imagenet_lt": {
+        "name": "imagenet_lt",
+        "splits_dir": "./data/imagenet_lt_splits",
+        "logits_dir": "./outputs/logits/imagenet_lt/",
+        "num_classes": 1000,
+        "num_groups": 2,
+        "expert_names": ["ce_baseline", "logitadjust_baseline", "balsoftmax_baseline"],
+    },
 }
 
 CONFIG = {
@@ -310,6 +318,17 @@ def create_dataloaders(config: Dict) -> Tuple[DataLoader, DataLoader]:
         f"    Train: {train_logits.shape[0]:,} samples, "
         f"{train_logits.shape[1]} experts, {train_logits.shape[2]} classes"
     )
+    print(f"    Train logits shape: {train_logits.shape}")
+    print(f"    Train labels shape: {train_labels.shape}")
+    
+    # Check size mismatch for train
+    if train_logits.shape[0] != train_labels.shape[0]:
+        print(f"    ⚠️  WARNING: Size mismatch! Logits: {train_logits.shape[0]}, Labels: {train_labels.shape[0]}")
+        # Take minimum to avoid error
+        min_size = min(train_logits.shape[0], train_labels.shape[0])
+        print(f"    Truncating to {min_size} samples")
+        train_logits = train_logits[:min_size]
+        train_labels = train_labels[:min_size]
 
     # Validation: sử dụng 'val' split (balanced)
     print("  Loading val split...")
@@ -317,6 +336,17 @@ def create_dataloaders(config: Dict) -> Tuple[DataLoader, DataLoader]:
     val_labels = load_labels(splits_dir, "val", DEVICE)
 
     print(f"    Val: {val_logits.shape[0]:,} samples")
+    print(f"    Val logits shape: {val_logits.shape}")
+    print(f"    Val labels shape: {val_labels.shape}")
+    
+    # Check size mismatch
+    if val_logits.shape[0] != val_labels.shape[0]:
+        print(f"    ⚠️  WARNING: Size mismatch! Logits: {val_logits.shape[0]}, Labels: {val_labels.shape[0]}")
+        # Take minimum to avoid error
+        min_size = min(val_logits.shape[0], val_labels.shape[0])
+        print(f"    Truncating to {min_size} samples")
+        val_logits = val_logits[:min_size]
+        val_labels = val_labels[:min_size]
 
     # Create datasets
     train_dataset = TensorDataset(train_logits, train_labels)
@@ -872,7 +902,7 @@ def main():
         "--dataset",
         type=str,
         default="cifar100_lt_if100",
-        choices=["cifar100_lt_if100", "inaturalist2018"],
+        choices=["cifar100_lt_if100", "inaturalist2018", "imagenet_lt"],
         help="Dataset name"
     )
     parser.add_argument(
@@ -944,18 +974,18 @@ def main():
         print(f"  Experts: {dataset_config['expert_names']}")
 
         # Update config from arguments
-    CONFIG["gating"]["routing"] = args.routing
-    CONFIG["gating"]["top_k"] = args.top_k
-    CONFIG["gating"]["epochs"] = args.epochs
-    CONFIG["gating"]["batch_size"] = args.batch_size
-    CONFIG["gating"]["lr"] = args.lr
-    CONFIG["gating"]["lambda_lb"] = args.lambda_lb
-    CONFIG["gating"]["lambda_h"] = args.lambda_h
+        CONFIG["gating"]["routing"] = args.routing
+        CONFIG["gating"]["top_k"] = args.top_k
+        CONFIG["gating"]["epochs"] = args.epochs
+        CONFIG["gating"]["batch_size"] = args.batch_size
+        CONFIG["gating"]["lr"] = args.lr
+        CONFIG["gating"]["lambda_lb"] = args.lambda_lb
+        CONFIG["gating"]["lambda_h"] = args.lambda_h
 
-    # Train
-    model, history = train_gating(CONFIG)
+        # Train
+        model, history = train_gating(CONFIG)
 
-    print("\n🎉 Done!")
+        print("\n🎉 Done!")
     
     finally:
         # Restore stdout and close log file

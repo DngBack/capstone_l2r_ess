@@ -22,7 +22,7 @@ def parse_arguments():
     parser.add_argument(
         '--dataset',
         type=str,
-        choices=['cifar100_lt_if100', 'inaturalist2018'],
+        choices=['cifar100_lt_if100', 'inaturalist2018', 'imagenet_lt'],
         default='cifar100_lt_if100',
         help='Dataset to train on (default: cifar100_lt_if100)'
     )
@@ -88,14 +88,8 @@ def parse_arguments():
     parser.add_argument(
         '--use-expert-split',
         action='store_true',
-        default=True,
-        help='Use expert split (90%% of train) for training (default: True)'
-    )
-    
-    parser.add_argument(
-        '--use-full-train',
-        action='store_true',
-        help='Use full training set instead of expert split'
+        default=False,
+        help='Use expert split (90%% of train) for training. If not set, uses full train set (default: uses full train)'
     )
     
     parser.add_argument(
@@ -171,7 +165,9 @@ def train_single_expert_wrapper(expert_key, args):
         from src.train.train_expert import train_single_expert
         
         # Determine which split to use
-        use_expert_split = not args.use_full_train  # Default True unless --use-full-train
+        # Default: use full train set (use_expert_split=False)
+        # If --use-expert-split flag is set, use expert split instead
+        use_expert_split = args.use_expert_split
         
         if args.verbose:
             print(f"\n📋 Training configuration for {expert_key}:")
@@ -236,16 +232,16 @@ def main():
         print("=" * 60)
         
         # Determine split usage
-        use_expert_split = not args.use_full_train
+        use_expert_split = args.use_expert_split
         if use_expert_split:
             print("📊 Training Mode: Using EXPERT split (90% of train)")
-            print("   - Trains on 9,719 samples (expert split)")
-            print("   - Validates on 1,000 samples (balanced val)")
+            print("   - Trains on expert split (90% of train set)")
+            print("   - Validates on balanced val set")
             print("   - Uses reweighted metrics for validation")
         else:
-            print("📊 Training Mode: Using FULL train set")
-            print("   - Trains on 10,847 samples (full train)")
-            print("   - Validates on 1,000 samples (balanced val)")
+            print("📊 Training Mode: Using FULL train set (default)")
+            print("   - Trains on full train set (100% of train)")
+            print("   - Validates on balanced val set")
             print("   - Uses reweighted metrics for validation")
         print()
         

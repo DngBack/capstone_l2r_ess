@@ -11,6 +11,7 @@ Worst-group Plug-in with Gating (3 Experts) per "Learning to Reject Meets Long-T
 Usage:
     python run_worst_plugin_gating.py --dataset cifar100_lt_if100
     python run_worst_plugin_gating.py --dataset inaturalist2018
+    python run_worst_plugin_gating.py --dataset imagenet_lt
 
 Inputs (expected existing):
 - Splits dir: ./data/{dataset_name}_splits/
@@ -34,6 +35,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import matplotlib.pyplot as plt
+import pandas as pd
 
 
 @dataclass
@@ -95,6 +97,15 @@ DATASET_CONFIGS = {
         "expert_names": ["ce_baseline", "logitadjust_baseline", "balsoftmax_baseline"],
         "num_classes": 8142,
         "num_groups": 2,
+    },
+    "imagenet_lt": {
+        "splits_dir": "./data/imagenet_lt_splits",
+        "logits_dir": "./outputs/logits/imagenet_lt",
+        "gating_checkpoint": "./checkpoints/gating_map/imagenet_lt/final_gating.pth",
+        "results_dir": "./results/ltr_plugin/imagenet_lt",
+        "expert_names": ["ce_baseline", "logitadjust_baseline", "balsoftmax_baseline"],
+        "num_classes": 1000,
+        "num_groups": 2,
     }
 }
 
@@ -151,10 +162,10 @@ def load_labels(split: str, device: str = DEVICE) -> torch.Tensor:
         if isinstance(t, torch.Tensor):
             return t.to(device=device, dtype=torch.long)
     
-    # Fallback: load from JSON targets file (for iNaturalist) or CIFAR-style loading
+    # Fallback: load from JSON targets file (for iNaturalist/ImageNet-LT) or CIFAR-style loading
     targets_file = Path(CFG.splits_dir) / f"{split}_targets.json"
     if targets_file.exists():
-        # iNaturalist: load targets from JSON
+        # iNaturalist/ImageNet-LT: load targets from JSON
         with open(targets_file, "r", encoding="utf-8") as f:
             targets = json.load(f)
         return torch.tensor(targets, dtype=torch.long, device=device)
@@ -595,10 +606,36 @@ def main():
 
     expert_logits_s1 = load_expert_logits(CFG.expert_names, "tunev", DEVICE)
     labels_s1 = load_labels("tunev", DEVICE)
+    
+    # Validate sizes match for s1 (tunev)
+    if expert_logits_s1.shape[0] != labels_s1.shape[0]:
+        print(f"⚠️  WARNING: Size mismatch for tunev! Logits: {expert_logits_s1.shape[0]}, Labels: {labels_s1.shape[0]}")
+        min_size = min(expert_logits_s1.shape[0], labels_s1.shape[0])
+        print(f"    Truncating to {min_size} samples")
+        expert_logits_s1 = expert_logits_s1[:min_size]
+        labels_s1 = labels_s1[:min_size]
+    
     expert_logits_s2 = load_expert_logits(CFG.expert_names, "val", DEVICE)
     labels_s2 = load_labels("val", DEVICE)
+    
+    # Validate sizes match for s2 (val)
+    if expert_logits_s2.shape[0] != labels_s2.shape[0]:
+        print(f"⚠️  WARNING: Size mismatch for val! Logits: {expert_logits_s2.shape[0]}, Labels: {labels_s2.shape[0]}")
+        min_size = min(expert_logits_s2.shape[0], labels_s2.shape[0])
+        print(f"    Truncating to {min_size} samples")
+        expert_logits_s2 = expert_logits_s2[:min_size]
+        labels_s2 = labels_s2[:min_size]
+    
     expert_logits_test = load_expert_logits(CFG.expert_names, "test", DEVICE)
     labels_test = load_labels("test", DEVICE)
+    
+    # Validate sizes match for test
+    if expert_logits_test.shape[0] != labels_test.shape[0]:
+        print(f"⚠️  WARNING: Size mismatch for test! Logits: {expert_logits_test.shape[0]}, Labels: {labels_test.shape[0]}")
+        min_size = min(expert_logits_test.shape[0], labels_test.shape[0])
+        print(f"    Truncating to {min_size} samples")
+        expert_logits_test = expert_logits_test[:min_size]
+        labels_test = labels_test[:min_size]
 
     post_s1 = compute_mixture_posterior(expert_logits_s1, gating, DEVICE)
     post_s2 = compute_mixture_posterior(expert_logits_s2, gating, DEVICE)
@@ -732,6 +769,31 @@ def main():
     print(f"Saved results to: {out_json}")
     print(f"Saved plot to: {plot_path}")
     print(f"Saved gap plot to: {gap_plot_path}")
+    
+    # Export CSV for easy tracking
+    csv_data = []
+    for r in results:
+        csv_data.append({
+            'target_rejection': r['target_rejection'],
+            'test_balanced_error': r['test_metrics']['balanced_error'],
+            'test_worst_group_error': r['test_metrics']['worst_group_error'],
+            'test_coverage': r['test_metrics']['coverage'],
+            'test_head_error': r['test_metrics']['group_errors'][0] if len(r['test_metrics']['group_errors']) >= 2 else None,
+            'test_tail_error': r['test_metrics']['group_errors'][1] if len(r['test_metrics']['group_errors']) >= 2 else None,
+            'test_tail_minus_head': r['test_metrics']['group_errors'][1] - r['test_metrics']['group_errors'][0] if len(r['test_metrics']['group_errors']) >= 2 else None,
+            'beta_head': r['beta'][0] if len(r['beta']) >= 2 else None,
+            'beta_tail': r['beta'][1] if len(r['beta']) >= 2 else None,
+            'alpha_head': r['alpha'][0] if len(r['alpha']) >= 2 else None,
+            'alpha_tail': r['alpha'][1] if len(r['alpha']) >= 2 else None,
+            'mu_head': r['mu'][0] if len(r['mu']) >= 2 else None,
+            'mu_tail': r['mu'][1] if len(r['mu']) >= 2 else None,
+            'cost_test': r['cost_test'],
+        })
+    
+    df = pd.DataFrame(csv_data)
+    csv_path = Path(CFG.results_dir) / "ltr_plugin_gating_worst.csv"
+    df.to_csv(csv_path, index=False)
+    print(f"Saved CSV results to: {csv_path}")
 
 
 if __name__ == "__main__":
@@ -743,7 +805,7 @@ if __name__ == "__main__":
         "--dataset",
         type=str,
         default="cifar100_lt_if100",
-        choices=["cifar100_lt_if100", "inaturalist2018"],
+        choices=["cifar100_lt_if100", "inaturalist2018", "imagenet_lt"],
         help="Dataset name"
     )
     parser.add_argument(

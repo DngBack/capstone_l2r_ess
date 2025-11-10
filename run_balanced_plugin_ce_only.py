@@ -3,26 +3,32 @@
 Standalone Balanced Plug-in (CE-only) per "Learning to Reject Meets Long-Tail Learning"
 =======================================================================================
 
-- Loads CIFAR-100-LT splits and CE expert logits you produced
+- Loads CIFAR-100-LT/iNaturalist 2018/ImageNet-LT splits and CE expert logits you produced
 - Builds head/tail groups from train class counts (tail <= 20 samples)
 - Implements Theorem 1 decision rules (classifier and rejector)
 - Implements Algorithm 1 (power-iteration) over α and 1D λ grid for μ
 - Runs theory-compliant cost sweep: optimize (α, μ) per cost, one RC point per cost
 - Evaluates on test; computes balanced error RC and AURC; saves JSON and plots
 
+Usage:
+    python run_balanced_plugin_ce_only.py --dataset cifar100_lt_if100
+    python run_balanced_plugin_ce_only.py --dataset inaturalist2018
+    python run_balanced_plugin_ce_only.py --dataset imagenet_lt
+
 Inputs (expected existing):
-- Splits dir: ./data/cifar100_lt_if100_splits_fixed/
-- Logits dir: ./outputs/logits/cifar100_lt_if100/ce_baseline/{split}_logits.pt
-- Targets (if available): ./outputs/logits/cifar100_lt_if100/ce_baseline/{split}_targets.pt
+- Splits dir: ./data/{dataset_name}_splits/
+- Logits dir: ./outputs/logits/{dataset_name}/ce_baseline/{split}_logits.pt
+- Targets (if available): ./outputs/logits/{dataset_name}/ce_baseline/{split}_targets.pt
 
 Outputs:
-- results/ltr_plugin/cifar100_lt_if100/ltr_plugin_ce_only_balanced.json
-- results/ltr_plugin/cifar100_lt_if100/ltr_rc_curves_balanced_ce_only_test.png
+- results/ltr_plugin/{dataset_name}/ltr_plugin_ce_only_balanced.json
+- results/ltr_plugin/{dataset_name}/ltr_rc_curves_balanced_ce_only_test.png
 """
 
+import argparse
 import json
 from pathlib import Path
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
@@ -30,6 +36,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import matplotlib.pyplot as plt
+import pandas as pd
 
 
 # ================================
@@ -49,32 +56,67 @@ class Config:
     tail_threshold: int = 20
 
     # Optimizer settings - extended range including paper values {1, 6, 11}
-    mu_lambda_grid: List[float] = (
-        -5.0,
-        -2.0,
-        -1.0,
-        0.0,
-        1.0,
-        2.0,
-        3.0,
-        5.0,
-        6.0,
-        8.0,
-        11.0,
-        15.0,
-        20.0,
-    )
+    mu_lambda_grid: List[float] = field(default_factory=lambda: [
+        -5.0, -2.0, -1.0, 0.0, 1.0, 2.0, 3.0, 5.0, 6.0, 8.0, 11.0, 15.0, 20.0,
+    ])
     power_iter_iters: int = 20  # More iterations for convergence
     power_iter_damping: float = 0.5  # Higher damping for stability
 
     # Cost sweep (theory-compliant): one RC point per cost
-    cost_sweep: List[float] = ()  # unused when target_rejections set
+    cost_sweep: List[float] = field(default_factory=list)  # unused when target_rejections set
     # Target rejection grid to match paper plots exactly
-    target_rejections: List[float] = (0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8)
+    target_rejections: List[float] = field(default_factory=lambda: [0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8])
 
     seed: int = 42
 
 
+# Dataset configurations
+DATASET_CONFIGS = {
+    "cifar100_lt_if100": {
+        "splits_dir": "./data/cifar100_lt_if100_splits_fixed",
+        "logits_dir": "./outputs/logits/cifar100_lt_if100/ce_baseline",
+        "results_dir": "./results/ltr_plugin/cifar100_lt_if100",
+        "num_classes": 100,
+        "num_groups": 2,
+    },
+    "inaturalist2018": {
+        "splits_dir": "./data/inaturalist2018_splits",
+        "logits_dir": "./outputs/logits/inaturalist2018/ce_baseline",
+        "results_dir": "./results/ltr_plugin/inaturalist2018",
+        "num_classes": 8142,
+        "num_groups": 2,
+    },
+    "imagenet_lt": {
+        "splits_dir": "./data/imagenet_lt_splits",
+        "logits_dir": "./outputs/logits/imagenet_lt/ce_baseline",
+        "results_dir": "./results/ltr_plugin/imagenet_lt",
+        "num_classes": 1000,
+        "num_groups": 2,
+    }
+}
+
+
+def setup_config(dataset_name: str) -> Config:
+    """Setup Config based on dataset selection."""
+    if dataset_name not in DATASET_CONFIGS:
+        raise ValueError(f"Unknown dataset: {dataset_name}. Choose from {list(DATASET_CONFIGS.keys())}")
+    
+    ds_config = DATASET_CONFIGS[dataset_name]
+    
+    # Create Config with dataset-specific settings
+    config = Config(
+        dataset_name=dataset_name,
+        splits_dir=ds_config["splits_dir"],
+        logits_dir=ds_config["logits_dir"],
+        results_dir=ds_config["results_dir"],
+        num_classes=ds_config["num_classes"],
+        num_groups=ds_config["num_groups"],
+    )
+    
+    return config
+
+
+# Default config (will be overridden by main)
 CFG = Config()
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -100,18 +142,31 @@ def load_labels(split: str, device: str = DEVICE) -> torch.Tensor:
         if isinstance(t, torch.Tensor):
             return t.to(device=device, dtype=torch.long)
 
+    # Fallback: load from JSON targets file (for iNaturalist/ImageNet-LT) or CIFAR-style loading
+    targets_file = Path(CFG.splits_dir) / f"{split}_targets.json"
+    if targets_file.exists():
+        # iNaturalist/ImageNet-LT: load targets from JSON
+        with open(targets_file, "r", encoding="utf-8") as f:
+            targets = json.load(f)
+        return torch.tensor(targets, dtype=torch.long, device=device)
+    
     # Fallback: reconstruct from CIFAR100 and indices
-    import torchvision
-
-    indices_file = Path(CFG.splits_dir) / f"{split}_indices.json"
-    with open(indices_file, "r", encoding="utf-8") as f:
-        indices = json.load(f)
-    is_train = split in ("expert", "gating", "train")
-    ds = torchvision.datasets.CIFAR100(root="./data", train=is_train, download=False)
-    labels = torch.tensor(
-        [ds.targets[i] for i in indices], dtype=torch.long, device=device
-    )
-    return labels
+    if CFG.dataset_name == "cifar100_lt_if100":
+        import torchvision
+        indices_file = Path(CFG.splits_dir) / f"{split}_indices.json"
+        with open(indices_file, "r", encoding="utf-8") as f:
+            indices = json.load(f)
+        is_train = split in ("expert", "gating", "train")
+        ds = torchvision.datasets.CIFAR100(root="./data", train=is_train, download=False)
+        labels = torch.tensor(
+            [ds.targets[i] for i in indices], dtype=torch.long, device=device
+        )
+        return labels
+    else:
+        raise FileNotFoundError(
+            f"Could not find labels for split {split}. "
+            f"Expected either {cand} or {targets_file}"
+        )
 
 
 def load_class_weights(device: str = DEVICE) -> torch.Tensor:
@@ -140,27 +195,7 @@ def load_class_weights(device: str = DEVICE) -> torch.Tensor:
     print(f"Test distribution (balanced): {1.0 / CFG.num_classes:.6f}")
     print(f"Importance weights: head={weights[0]:.6f}, tail={weights[-1]:.6f}")
     print(f"Weight ratio (head/tail): {weights[0] / weights[-1]:.1f}x")
-
-    # DEBUG: Print all class weights
-    print(f"\nDEBUG: All class importance weights:")
-    print(f"Class 0-9:   {[f'{weights[i]:.6f}' for i in range(10)]}")
-    print(f"Class 10-19: {[f'{weights[i]:.6f}' for i in range(10, 20)]}")
-    print(f"Class 20-29: {[f'{weights[i]:.6f}' for i in range(20, 30)]}")
-    print(f"Class 30-39: {[f'{weights[i]:.6f}' for i in range(30, 40)]}")
-    print(f"Class 40-49: {[f'{weights[i]:.6f}' for i in range(40, 50)]}")
-    print(f"Class 50-59: {[f'{weights[i]:.6f}' for i in range(50, 60)]}")
-    print(f"Class 60-69: {[f'{weights[i]:.6f}' for i in range(60, 70)]}")
-    print(f"Class 70-79: {[f'{weights[i]:.6f}' for i in range(70, 80)]}")
-    print(f"Class 80-89: {[f'{weights[i]:.6f}' for i in range(80, 90)]}")
-    print(f"Class 90-99: {[f'{weights[i]:.6f}' for i in range(90, 100)]}")
-
-    # Verify weights are calculated per class
-    print(f"\nDEBUG: Verification - weights shape: {weights.shape}")
-    print(f"DEBUG: First 5 weights: {weights[:5]}")
-    print(f"DEBUG: Last 5 weights: {weights[-5:]}")
-    print(
-        f"DEBUG: All weights are different: {len(np.unique(weights)) == len(weights)}"
-    )
+    print(f"  (Using importance weighting to re-weight test set to training distribution)")
 
     return torch.tensor(weights, dtype=torch.float32, device=device)
 
@@ -284,12 +319,6 @@ def compute_metrics(
         # This ensures test set reflects training distribution for fair evaluation
         device = labels.device
         class_weights = class_weights.to(device)
-        print(
-            f"DEBUG: Using importance weighting with class_weights shape: {class_weights.shape}"
-        )
-        print(
-            f"DEBUG: Class weights range: {class_weights.min().item():.6f} to {class_weights.max().item():.6f}"
-        )
 
         for g in range(num_groups):
             mask = groups == g  # mask for accepted samples from group g
@@ -325,7 +354,6 @@ def compute_metrics(
                     group_errors.append(1.0)
     else:
         # Standard (unweighted) error computation
-        print("DEBUG: NOT using importance weighting")
         for g in range(num_groups):
             mask = groups == g  # mask for accepted samples from group g
 
@@ -591,8 +619,25 @@ def main():
     print("Loading S1 (tunev) and S2 (val) for selection/evaluation...")
     logits_tunev = load_logits("tunev", DEVICE)
     labels_tunev = load_labels("tunev", DEVICE)
+    
+    # Validate sizes match for tunev
+    if logits_tunev.shape[0] != labels_tunev.shape[0]:
+        print(f"⚠️  WARNING: Size mismatch for tunev! Logits: {logits_tunev.shape[0]}, Labels: {labels_tunev.shape[0]}")
+        min_size = min(logits_tunev.shape[0], labels_tunev.shape[0])
+        print(f"    Truncating to {min_size} samples")
+        logits_tunev = logits_tunev[:min_size]
+        labels_tunev = labels_tunev[:min_size]
+    
     logits_val = load_logits("val", DEVICE)
     labels_val = load_labels("val", DEVICE)
+    
+    # Validate sizes match for val
+    if logits_val.shape[0] != labels_val.shape[0]:
+        print(f"⚠️  WARNING: Size mismatch for val! Logits: {logits_val.shape[0]}, Labels: {labels_val.shape[0]}")
+        min_size = min(logits_val.shape[0], labels_val.shape[0])
+        print(f"    Truncating to {min_size} samples")
+        logits_val = logits_val[:min_size]
+        labels_val = labels_val[:min_size]
 
     print("Building class-to-group mapping (tail <= 20)...")
     class_to_group = build_class_to_group()
@@ -607,6 +652,15 @@ def main():
     # Check baseline balanced error on test set
     logits_test = load_logits("test", DEVICE)
     labels_test = load_labels("test", DEVICE)
+    
+    # Validate sizes match
+    if logits_test.shape[0] != labels_test.shape[0]:
+        print(f"⚠️  WARNING: Size mismatch for test! Logits: {logits_test.shape[0]}, Labels: {labels_test.shape[0]}")
+        min_size = min(logits_test.shape[0], labels_test.shape[0])
+        print(f"    Truncating to {min_size} samples")
+        logits_test = logits_test[:min_size]
+        labels_test = labels_test[:min_size]
+    
     posterior_test = F.softmax(logits_test, dim=-1)
 
     # Compute baseline balanced error (no rejection) with importance weighting
@@ -970,10 +1024,11 @@ def main():
 
     save_dict = {
         "objectives": ["balanced", "worst_group"],
-        "description": "CORRECTED: Targeted rejection grid (0.0..0.8) with val-based hyperparameter selection per paper Algorithm 1",
-        "method": "plug-in_balanced_val_selection",
+        "description": "CORRECTED: Targeted rejection grid (0.0..0.8) with val-based hyperparameter selection per paper Algorithm 1. Uses CE expert only (no gating).",
+        "method": "plug-in_balanced_val_selection_ce_only",
         "hyperparameter_selection": "val_based",  # Indicate we used val for selection
         "algorithm": "Algorithm 1 from paper - optimize (α,μ) on tunev, select μ on val",
+        "expert": "ce_baseline",
         "results_per_cost": results_per_cost,
         "rc_curve": {
             "val": {
@@ -1003,6 +1058,36 @@ def main():
     with open(out_json, "w", encoding="utf-8") as f:
         json.dump(save_dict, f, indent=2)
     print(f"Saved results to: {out_json}")
+    
+    # Export CSV for easy tracking
+    csv_data = []
+    for r in results_per_cost:
+        csv_data.append({
+            'target_rejection': r['target_rejection'],
+            'val_balanced_error': r['val_metrics']['balanced_error'],
+            'val_worst_group_error': r['val_metrics']['worst_group_error'],
+            'val_coverage': r['val_metrics']['coverage'],
+            'val_head_error': r['val_metrics']['group_errors'][0] if len(r['val_metrics']['group_errors']) >= 2 else None,
+            'val_tail_error': r['val_metrics']['group_errors'][1] if len(r['val_metrics']['group_errors']) >= 2 else None,
+            'val_tail_minus_head': r['val_metrics']['group_errors'][1] - r['val_metrics']['group_errors'][0] if len(r['val_metrics']['group_errors']) >= 2 else None,
+            'test_balanced_error': r['test_metrics']['balanced_error'],
+            'test_worst_group_error': r['test_metrics']['worst_group_error'],
+            'test_coverage': r['test_metrics']['coverage'],
+            'test_head_error': r['test_metrics']['group_errors'][0] if len(r['test_metrics']['group_errors']) >= 2 else None,
+            'test_tail_error': r['test_metrics']['group_errors'][1] if len(r['test_metrics']['group_errors']) >= 2 else None,
+            'test_tail_minus_head': r['test_metrics']['group_errors'][1] - r['test_metrics']['group_errors'][0] if len(r['test_metrics']['group_errors']) >= 2 else None,
+            'alpha_head': r['alpha'][0] if len(r['alpha']) >= 2 else None,
+            'alpha_tail': r['alpha'][1] if len(r['alpha']) >= 2 else None,
+            'mu_head': r['mu'][0] if len(r['mu']) >= 2 else None,
+            'mu_tail': r['mu'][1] if len(r['mu']) >= 2 else None,
+            'cost_val': r['cost_val'],
+            'cost_test': r['cost_test'],
+        })
+    
+    df = pd.DataFrame(csv_data)
+    csv_path = Path(CFG.results_dir) / "ltr_plugin_ce_only_balanced.csv"
+    df.to_csv(csv_path, index=False)
+    print(f"Saved CSV results to: {csv_path}")
 
     # Print AURCs
     print(f"Val AURC - Balanced: {aurc_val_bal:.4f} | Worst-group: {aurc_val_wst:.4f}")
@@ -1043,4 +1128,67 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    import sys
+    from datetime import datetime
+    
+    parser = argparse.ArgumentParser(description="Balanced L2R Plugin with CE Expert Only")
+    parser.add_argument(
+        "--dataset",
+        type=str,
+        default="cifar100_lt_if100",
+        choices=["cifar100_lt_if100", "inaturalist2018", "imagenet_lt"],
+        help="Dataset name"
+    )
+    parser.add_argument(
+        "--log-file",
+        type=str,
+        default=None,
+        help="Path to log file. If provided, all output will be saved to this file"
+    )
+    args = parser.parse_args()
+    
+    # Setup logging if log_file is provided
+    original_stdout = sys.stdout
+    log_file_handle = None
+    
+    if args.log_file:
+        log_path = Path(args.log_file)
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        log_file_handle = open(log_path, 'w', encoding='utf-8')
+        
+        # Create a class that writes to both stdout and log file
+        class TeeOutput:
+            def __init__(self, *files):
+                self.files = files
+            
+            def write(self, obj):
+                for f in self.files:
+                    f.write(obj)
+                    f.flush()
+            
+            def flush(self):
+                for f in self.files:
+                    f.flush()
+        
+        sys.stdout = TeeOutput(original_stdout, log_file_handle)
+        print(f"\n{'='*80}")
+        print(f"LOGGING TO FILE: {log_path}")
+        print(f"STARTED AT: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        print(f"{'='*80}\n")
+    
+    try:
+        # Setup config based on dataset
+        CFG = setup_config(args.dataset)
+        
+        print(f"✓ Using dataset: {args.dataset}")
+        print(f"  Classes: {CFG.num_classes}")
+        print(f"  Expert: CE baseline only (no gating)")
+        print(f"  Logits dir: {CFG.logits_dir}")
+        
+        main()
+    finally:
+        # Restore stdout and close log file
+        if log_file_handle is not None:
+            sys.stdout = original_stdout
+            log_file_handle.close()
+            print(f"\n[Log saved to: {args.log_file}]")

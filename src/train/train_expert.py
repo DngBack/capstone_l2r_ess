@@ -63,20 +63,22 @@ EXPERT_CONFIGS = {
     },
 }
 
-# iNaturalist specific configs (cosine scheduler, 200 epochs)
+# iNaturalist and ImageNet-LT specific configs (cosine scheduler with step decay, 200 epochs)
+# Paper: For ImageNet and iNaturalist, warmup 5 epochs to reach base LR 0.4,
+#        apply learning rate decay 0.1 at epochs 45, 100, 150, and use cosine annealing
 EXPERT_CONFIGS_INATURALIST = {
     "ce": {
         "name": "ce_baseline",
         "loss_type": "ce",
-        "epochs": 200,  # Paper: 200 epochs for iNaturalist
-        "lr": 0.4,
-        "weight_decay": 1e-4,
+        "epochs": 200,  # Paper: 200 epochs for iNaturalist and ImageNet-LT
+        "lr": 0.4,  # Paper: base LR 0.4
+        "weight_decay": 1e-4,  # Paper: weight decay 10^-4
         "dropout_rate": 0.0,
-        "milestones": [45, 100, 150],  # Paper: decay at epochs [45, 100, 150]
-        "gamma": 0.1,
-        "warmup_epochs": 5,  # Paper: 5 epochs warmup
+        "milestones": [45, 100, 150],  # Paper: decay 0.1 at epochs 45, 100, 150
+        "gamma": 0.1,  # Paper: decay factor 0.1
+        "warmup_epochs": 5,  # Paper: 5 epochs warmup to reach base LR 0.4
         "use_manual_lr": True,
-        "use_cosine": False,
+        "use_cosine": True,  # Paper: use cosine annealing scheduler
     },
     "logitadjust": {
         "name": "logitadjust_baseline",
@@ -85,11 +87,11 @@ EXPERT_CONFIGS_INATURALIST = {
         "lr": 0.4,
         "weight_decay": 1e-4,
         "dropout_rate": 0.0,
-        "milestones": [],
+        "milestones": [45, 100, 150],  # Paper: decay 0.1 at epochs 45, 100, 150
         "gamma": 0.1,
+        "warmup_epochs": 5,  # Paper: 5 epochs warmup
         "use_manual_lr": True,
-        "use_cosine": True,  # Cosine annealing
-        "warmup_epochs": 5,
+        "use_cosine": True,  # Use cosine annealing
     },
     "balsoftmax": {
         "name": "balsoftmax_baseline",
@@ -98,11 +100,11 @@ EXPERT_CONFIGS_INATURALIST = {
         "lr": 0.4,
         "weight_decay": 1e-4,
         "dropout_rate": 0.0,
-        "milestones": [],
+        "milestones": [45, 100, 150],  # Paper: decay 0.1 at epochs 45, 100, 150
         "gamma": 0.1,
+        "warmup_epochs": 5,  # Paper: 5 epochs warmup
         "use_manual_lr": True,
-        "use_cosine": True,  # Cosine annealing
-        "warmup_epochs": 5,
+        "use_cosine": True,  # Use cosine annealing
     },
 }
 
@@ -128,6 +130,19 @@ DATASET_CONFIGS = {
         "num_groups": 2,
         "backbone": "resnet50",
         "batch_size": 1024,
+        "epochs": 200,
+    },
+    "imagenet_lt": {
+        "name": "imagenet_lt",
+        "data_root": "./data",
+        "splits_dir": "./data/imagenet_lt_splits",
+        "data_dir": "./data/imagenet_lt",
+        "train_label_file": "ImageNet_LT_train.txt",
+        "val_label_file": "ImageNet_LT_test.txt",
+        "num_classes": 1000,
+        "num_groups": 2,
+        "backbone": "resnet50",
+        "batch_size": 512,
         "epochs": 200,
     }
 }
@@ -240,9 +255,6 @@ def get_dataloaders(use_expert_split=True, dataset_name=None, override_batch_siz
         with open(splits_dir / "val_indices.json", "r") as f:
             val_indices = json.load(f)
         
-        # Create dataset subsets with transforms
-        from src.data.enhanced_datasets import CIFAR100LTDataset
-        
         # For iNaturalist, we need to adapt the approach
         # Create a simple wrapper that applies transforms
         class INaturalistSubset:
@@ -296,6 +308,135 @@ def get_dataloaders(use_expert_split=True, dataset_name=None, override_batch_siz
         
         return train_loader, val_loader
     
+    elif dataset_name == "imagenet_lt":
+        print("Loading ImageNet-LT datasets...")
+        
+        # Import ImageNet-LT utilities
+        from src.data.imagenet_lt_splits import (
+            ImageNetLTDataset, 
+            get_imagenet_lt_transforms
+        )
+        from torch.utils.data import DataLoader
+        
+        # Get dataset config
+        ds_config = DATASET_CONFIGS["imagenet_lt"]
+        
+        # Load train and val datasets with indices from splits
+        train_transform, eval_transform = get_imagenet_lt_transforms()
+        
+        # Load the full datasets
+        full_train_dataset = ImageNetLTDataset(
+            ds_config["data_dir"], 
+            ds_config["train_label_file"],
+            transform=None  # Will apply transform in DataLoader
+        )
+        full_val_dataset = ImageNetLTDataset(
+            ds_config["data_dir"],
+            ds_config["val_label_file"],
+            transform=None
+        )
+        
+        print(f"  Loaded train dataset: {len(full_train_dataset)} samples")
+        print(f"  Loaded val dataset: {len(full_val_dataset)} samples")
+        
+        # Load split indices
+        splits_dir = Path(ds_config["splits_dir"])
+        if use_expert_split:
+            # Use expert split (90% of train set)
+            with open(splits_dir / "expert_indices.json", "r") as f:
+                train_indices = json.load(f)
+            print(f"  Using EXPERT split (90% of train): {len(train_indices):,} samples")
+        else:
+            # Use full train set (100% of train set)
+            # Option 1: Load all indices from expert + gating if available
+            expert_indices_path = splits_dir / "expert_indices.json"
+            gating_indices_path = splits_dir / "gating_indices.json"
+            
+            if expert_indices_path.exists() and gating_indices_path.exists():
+                # Combine expert + gating to get full train
+                with open(expert_indices_path, "r") as f:
+                    expert_indices = json.load(f)
+                with open(gating_indices_path, "r") as f:
+                    gating_indices = json.load(f)
+                train_indices = expert_indices + gating_indices
+                print(f"  Using FULL train split (expert + gating): {len(train_indices):,} samples")
+                print(f"    Expert: {len(expert_indices):,} samples")
+                print(f"    Gating: {len(gating_indices):,} samples")
+            else:
+                # Fallback: use all indices from dataset
+                train_indices = list(range(len(full_train_dataset)))
+                print(f"  Using FULL train split (all samples): {len(train_indices):,} samples")
+        
+        with open(splits_dir / "val_indices.json", "r") as f:
+            val_indices = json.load(f)
+        print(f"  Using VAL split: {len(val_indices)} indices")
+        
+        # Create a simple wrapper that applies transforms
+        class ImageNetLTSubset:
+            def __init__(self, base_dataset, indices, transform=None):
+                self.base_dataset = base_dataset
+                # Validate and filter indices
+                max_idx = len(base_dataset.samples) - 1
+                valid_indices = [i for i in indices if 0 <= i <= max_idx]
+                if len(valid_indices) != len(indices):
+                    invalid_count = len(indices) - len(valid_indices)
+                    print(f"  Warning: {invalid_count} invalid indices filtered out (max valid index: {max_idx})")
+                self.indices = valid_indices
+                self.transform = transform
+            
+            def __len__(self):
+                return len(self.indices)
+            
+            def __getitem__(self, idx):
+                if idx >= len(self.indices):
+                    raise IndexError(f"Index {idx} out of range for dataset of size {len(self.indices)}")
+                actual_idx = self.indices[idx]
+                if actual_idx >= len(self.base_dataset.samples):
+                    raise IndexError(f"Actual index {actual_idx} out of range for base dataset of size {len(self.base_dataset.samples)}")
+                img_path, label = self.base_dataset.samples[actual_idx]
+                from PIL import Image
+                try:
+                    image = Image.open(img_path).convert('RGB')
+                except Exception as e:
+                    print(f"Warning: Failed to load {img_path}: {e}")
+                    image = Image.new('RGB', (224, 224), color='black')
+                
+                if self.transform:
+                    image = self.transform(image)
+                    
+                return image, label
+        
+        train_dataset = ImageNetLTSubset(full_train_dataset, train_indices, train_transform)
+        val_dataset = ImageNetLTSubset(full_val_dataset, val_indices, eval_transform)
+        
+        # Create dataloaders - use override if provided, else use ds_config
+        batch_size = override_batch_size if override_batch_size is not None else ds_config["batch_size"]
+        train_loader = DataLoader(
+            train_dataset, 
+            batch_size=batch_size,
+            shuffle=True,
+            num_workers=8,
+            pin_memory=True,
+            drop_last=True
+        )
+        val_loader = DataLoader(
+            val_dataset,
+            batch_size=batch_size,
+            shuffle=False,
+            num_workers=8,
+            pin_memory=True,
+            drop_last=False
+        )
+        
+        print(
+            f"  Train loader: {len(train_loader)} batches ({len(train_dataset):,} samples)"
+        )
+        print(
+            f"  Val loader: {len(val_loader)} batches ({len(val_dataset):,} samples)"
+        )
+        
+        return train_loader, val_loader
+    
     else:
         raise ValueError(f"Unsupported dataset: {dataset_name}")
 
@@ -318,7 +459,7 @@ def get_loss_function(loss_type, train_loader):
             train_loader.dataset.indices
         ]
     elif hasattr(train_loader.dataset, "base_dataset"):
-        # For INaturalistSubset
+        # For INaturalistSubset or ImageNetLTSubset
         train_targets = []
         for idx in train_loader.dataset.indices:
             _, label = train_loader.dataset.base_dataset.samples[idx]
@@ -365,11 +506,50 @@ def load_class_weights(splits_dir):
 
 
 def load_class_to_group(splits_dir, threshold=20):
-    """Load class-to-group mapping for head/tail classification."""
-    counts_path = Path(splits_dir) / "train_class_counts.json"
+    """
+    Load class-to-group mapping for head/tail classification.
+    
+    IMPORTANT: Head/tail classification is ALWAYS based on TRAIN counts, not on val/test counts.
+    This ensures consistency: a class that is head on train is head on val/test/tunev as well.
+    
+    Args:
+        splits_dir: Directory containing splits and class counts
+        threshold: Threshold for head/tail classification (default: 20 samples)
+    
+    Returns:
+        class_to_group: Array mapping class -> group (0=head, 1=tail), based on TRAIN counts
+    """
+    splits_path = Path(splits_dir)
     
     # Get number of classes from CONFIG
     num_classes = CONFIG["dataset"]["num_classes"]
+    
+    # Try to load pre-computed class_to_group.json first (if available)
+    group_path = splits_path / "class_to_group.json"
+    if group_path.exists():
+        print(f"Loading class_to_group from: {group_path}")
+        with open(group_path, "r") as f:
+            class_to_group = json.load(f)
+        
+        # Convert to numpy array
+        if isinstance(class_to_group, list):
+            class_to_group = np.array(class_to_group, dtype=np.int64)
+        else:
+            # If it's a dict, convert to list
+            class_to_group = np.array([class_to_group.get(str(i), 0) for i in range(num_classes)], dtype=np.int64)
+        
+        # Verify it has correct length
+        if len(class_to_group) != num_classes:
+            print(f"Warning: class_to_group has {len(class_to_group)} classes, expected {num_classes}")
+            print("  Recomputing from train_class_counts.json...")
+        else:
+            num_head = (class_to_group == 0).sum()
+            num_tail = (class_to_group == 1).sum()
+            print(f"  Loaded: {num_head} head classes, {num_tail} tail classes (based on train counts)")
+            return class_to_group
+    
+    # Fallback: compute from train_class_counts.json
+    counts_path = splits_path / "train_class_counts.json"
     
     if not counts_path.exists():
         print(f"Warning: {counts_path} not found, using midpoint split")
@@ -378,6 +558,8 @@ def load_class_to_group(splits_dir, threshold=20):
         class_to_group[num_classes // 2:] = 1
         return class_to_group
     
+    print(f"Loading train_class_counts from: {counts_path}")
+    print(f"  Computing class_to_group based on train counts (threshold = {threshold})")
     with open(counts_path, "r") as f:
         class_counts = json.load(f)
     
@@ -388,6 +570,11 @@ def load_class_to_group(splits_dir, threshold=20):
     tail_mask = counts <= threshold
     class_to_group = np.zeros(num_classes, dtype=np.int64)
     class_to_group[tail_mask] = 1  # 0=head, 1=tail
+    
+    num_head = (class_to_group == 0).sum()
+    num_tail = (class_to_group == 1).sum()
+    print(f"  Computed: {num_head} head classes, {num_tail} tail classes (based on train counts)")
+    print(f"  IMPORTANT: This classification applies to ALL splits (val/test/tunev)")
     
     return class_to_group
 
@@ -553,10 +740,78 @@ def export_logits_for_all_splits(model, expert_name):
             
             dataset = INaturalistSubset(full_dataset, indices, eval_transform)
             loader = DataLoader(dataset, batch_size=512, shuffle=False, num_workers=8)
+            
+        elif dataset_name == "imagenet_lt":
+            # Use ImageNet-LT transforms
+            from src.data.imagenet_lt_splits import (
+                ImageNetLTDataset,
+                get_imagenet_lt_transforms
+            )
+            _, eval_transform = get_imagenet_lt_transforms()
+            
+            # Get dataset config
+            ds_config = DATASET_CONFIGS["imagenet_lt"]
+            
+            # Determine which label file to use
+            if split_name in ["train", "expert", "gating"]:
+                label_file = ds_config["train_label_file"]
+            else:
+                label_file = ds_config["val_label_file"]
+            
+            # Create full dataset first
+            full_dataset = ImageNetLTDataset(
+                ds_config["data_dir"],
+                label_file,
+                transform=None
+            )
+            
+            # Create subset wrapper (same as in get_dataloaders)
+            class ImageNetLTSubset:
+                def __init__(self, base_dataset, indices, transform=None):
+                    self.base_dataset = base_dataset
+                    # Validate and filter indices
+                    max_idx = len(base_dataset.samples) - 1
+                    valid_indices = [i for i in indices if 0 <= i <= max_idx]
+                    if len(valid_indices) != len(indices):
+                        invalid_count = len(indices) - len(valid_indices)
+                        print(f"    Warning: {invalid_count} invalid indices filtered out (max valid index: {max_idx})")
+                    self.indices = valid_indices
+                    self.transform = transform
+                
+                def __len__(self):
+                    return len(self.indices)
+                
+                def __getitem__(self, idx):
+                    if idx >= len(self.indices):
+                        raise IndexError(f"Index {idx} out of range for dataset of size {len(self.indices)}")
+                    actual_idx = self.indices[idx]
+                    if actual_idx >= len(self.base_dataset.samples):
+                        raise IndexError(f"Actual index {actual_idx} out of range for base dataset of size {len(self.base_dataset.samples)}")
+                    img_path, label = self.base_dataset.samples[actual_idx]
+                    from PIL import Image
+                    try:
+                        image = Image.open(img_path).convert('RGB')
+                    except Exception as e:
+                        print(f"    Warning: Failed to load {img_path}: {e}")
+                        image = Image.new('RGB', (224, 224), color='black')
+                    
+                    if self.transform:
+                        image = self.transform(image)
+                        
+                    return image, label
+            
+            dataset = ImageNetLTSubset(full_dataset, indices, eval_transform)
+            loader = DataLoader(dataset, batch_size=512, shuffle=False, num_workers=8)
+            
         else:
             raise ValueError(f"Unsupported dataset for export: {dataset_name}")
 
         # Export logits
+        print(f"  Dataset size: {len(dataset):,} samples (after filtering invalid indices)")
+        print(f"  Original indices: {len(indices):,} samples")
+        if len(dataset) != len(indices):
+            print(f"  ⚠️  WARNING: Dataset size ({len(dataset)}) != indices size ({len(indices)})")
+        
         all_logits = []
         with torch.no_grad():
             for inputs, _ in tqdm(loader, desc=f"Exporting {split_name}"):
@@ -564,8 +819,12 @@ def export_logits_for_all_splits(model, expert_name):
                 all_logits.append(logits.cpu())
 
         all_logits = torch.cat(all_logits)
+        actual_exported = all_logits.shape[0]
         torch.save(all_logits.to(torch.float16), output_dir / f"{split_name}_logits.pt")
-        print(f"  Exported {split_name}: {len(indices):,} samples")
+        print(f"  Exported {split_name}: {actual_exported:,} logits (dataset had {len(dataset):,} samples)")
+        
+        if actual_exported != len(dataset):
+            print(f"  ⚠️  WARNING: Exported {actual_exported} logits but dataset had {len(dataset)} samples!")
 
     print(f"[SUCCESS] All logits exported to: {output_dir}")
 
@@ -574,21 +833,23 @@ def export_logits_for_all_splits(model, expert_name):
 
 
 def get_manual_lr(
-    epoch, iteration, total_iters_per_epoch, base_lr, warmup_epochs, milestones, gamma, use_cosine=False, total_epochs=None
+    epoch, iteration, total_iters_per_epoch, base_lr, warmup_epochs=None, warmup_steps=None, milestones=None, gamma=0.1, use_cosine=False, total_epochs=None
 ):
     """
     Manual LR scheduling theo paper specifications.
 
-    IMPORTANT: Paper says "15 steps" but in context where all other parameters
-    are in epochs, this means 15 EPOCHS, not iterations!
+    Supports two warmup modes:
+    - warmup_epochs: Warmup over N epochs (for CIFAR: 15 epochs, ImageNet/iNaturalist: 5 epochs)
+    - warmup_steps: Warmup over N iterations/steps (alternative option, rarely used)
 
     Args:
         epoch: Current epoch (0-indexed)
         iteration: Current iteration within epoch (0-indexed)
         total_iters_per_epoch: Total iterations per epoch
         base_lr: Base learning rate (0.4 for CE expert)
-        warmup_epochs: Number of warmup epochs (15)
-        milestones: List of epochs for decay [96, 192, 224]
+        warmup_epochs: Number of warmup epochs (for CIFAR: 15, ImageNet/iNaturalist: 5)
+        warmup_steps: Number of warmup steps/iterations (alternative, rarely used)
+        milestones: List of epochs for decay [96, 192, 224] or [45, 100, 150]
         gamma: Decay factor (0.1)
         use_cosine: If True, use cosine annealing after warmup
         total_epochs: Total number of epochs (required for cosine)
@@ -596,28 +857,56 @@ def get_manual_lr(
     Returns:
         Current learning rate
     """
-    # Warmup: linear warmup over warmup_epochs
-    if epoch < warmup_epochs:
-        current_progress = (epoch * total_iters_per_epoch + iteration) / (
-            warmup_epochs * total_iters_per_epoch
-        )
-        return base_lr * current_progress
-
-    # Post-warmup: epoch-based decays or cosine
-    if use_cosine and total_epochs:
-        # Cosine annealing after warmup
-        progress = (epoch - warmup_epochs) / (total_epochs - warmup_epochs)
-        lr = base_lr * 0.5 * (1 + math.cos(math.pi * progress))
-        return lr
+    milestones = milestones or []
+    current_iteration = epoch * total_iters_per_epoch + iteration
     
-    # Default: milestone-based decay
-    lr = base_lr
+    # Warmup: linear warmup to reach base_lr
+    # Priority: warmup_epochs > warmup_steps
+    if warmup_epochs is not None:
+        # Warmup over N epochs - for CIFAR (15 epochs) or ImageNet/iNaturalist (5 epochs)
+        if epoch < warmup_epochs:
+            current_progress = (epoch * total_iters_per_epoch + iteration) / (
+                warmup_epochs * total_iters_per_epoch
+            )
+            return base_lr * current_progress
+    elif warmup_steps is not None:
+        # Warmup over N steps (iterations) - alternative option, rarely used
+        if current_iteration < warmup_steps:
+            current_progress = current_iteration / warmup_steps
+            return base_lr * current_progress
+
+    # Post-warmup: apply step decay first (if milestones exist), then cosine annealing
+    # Step 1: Apply step decay to get current base LR
+    current_base_lr = base_lr
     if len(milestones) > 0:
         # Calculate decay factor based on how many milestones we've passed
         decay_count = sum(1 for m in milestones if epoch >= m)
-        lr = base_lr * (gamma**decay_count)
-
-    return lr
+        current_base_lr = base_lr * (gamma**decay_count)
+    
+    # Step 2: Apply cosine annealing if enabled
+    if use_cosine and total_epochs:
+        # Cosine annealing: apply cosine from after warmup to end of training
+        # Base LR changes at milestones, but cosine continues with new base LR
+        # For ImageNet/iNaturalist: warmup_epochs (5 epochs), then cosine
+        warmup_epochs_used = warmup_epochs if warmup_epochs is not None else 0
+        if warmup_steps is not None and warmup_epochs is None:
+            # Only use warmup_steps if warmup_epochs is not specified
+            # If warmup_steps, warmup ends very early (5 iterations), so start cosine from epoch 0
+            warmup_epochs_used = 0
+        
+        # Calculate cosine progress from warmup end to total epochs
+        if epoch >= warmup_epochs_used:
+            progress = (epoch - warmup_epochs_used) / (total_epochs - warmup_epochs_used)
+            # Clamp progress to [0, 1] to avoid issues
+            progress = min(max(progress, 0.0), 1.0)
+            lr = current_base_lr * 0.5 * (1 + math.cos(math.pi * progress))
+        else:
+            # Should not reach here if warmup logic is correct, but just in case
+            lr = current_base_lr
+        return lr
+    
+    # Default: only step decay (no cosine)
+    return current_base_lr
 
 
 def train_single_expert(expert_key, use_expert_split=True, override_epochs=None, override_batch_size=None):
@@ -632,7 +921,7 @@ def train_single_expert(expert_key, use_expert_split=True, override_epochs=None,
     """
     # Select expert configs based on dataset
     dataset_name = CONFIG["dataset"]["name"]
-    if dataset_name == "inaturalist2018":
+    if dataset_name in ["inaturalist2018", "imagenet_lt"]:
         if expert_key not in EXPERT_CONFIGS_INATURALIST:
             raise ValueError(f"Expert '{expert_key}' not found in EXPERT_CONFIGS_INATURALIST")
         expert_configs = EXPERT_CONFIGS_INATURALIST
@@ -698,15 +987,32 @@ def train_single_expert(expert_key, use_expert_split=True, override_epochs=None,
     
     if use_manual_lr:
         scheduler = None  # Manual LR scheduling, no scheduler object needed
-        warmup_epochs = expert_config.get("warmup_epochs", 0)
-        if use_cosine:
-            print(
-                f"[INFO] Using manual cosine LR scheduling (warmup={warmup_epochs} epochs, cosine annealing)"
-            )
+        warmup_epochs = expert_config.get("warmup_epochs", None)
+        warmup_steps = expert_config.get("warmup_steps", None)
+        # Print scheduling info
+        if warmup_steps is not None:
+            warmup_info = f"warmup={warmup_steps} steps to reach base LR"
         else:
-            print(
-                f"[INFO] Using manual LR scheduling (warmup={warmup_epochs} epochs, decay at {expert_config['milestones']})"
-            )
+            warmup_info = f"warmup={warmup_epochs} epochs"
+        
+        if use_cosine:
+            if len(expert_config.get("milestones", [])) > 0:
+                print(
+                    f"[INFO] Using manual LR scheduling ({warmup_info}, decay 0.1 at epochs {expert_config['milestones']}, cosine annealing)"
+                )
+            else:
+                print(
+                    f"[INFO] Using manual cosine LR scheduling ({warmup_info}, cosine annealing)"
+                )
+        else:
+            if len(expert_config.get("milestones", [])) > 0:
+                print(
+                    f"[INFO] Using manual LR scheduling ({warmup_info}, decay 0.1 at epochs {expert_config['milestones']})"
+                )
+            else:
+                print(
+                    f"[INFO] Using manual LR scheduling ({warmup_info})"
+                )
     elif use_cosine:
         warmup_epochs = expert_config.get("warmup_epochs", 0)
         scheduler = optim.lr_scheduler.CosineAnnealingLR(
@@ -755,9 +1061,10 @@ def train_single_expert(expert_key, use_expert_split=True, override_epochs=None,
                     iteration=batch_idx,
                     total_iters_per_epoch=len(train_loader),
                     base_lr=expert_config["lr"],
-                    warmup_epochs=expert_config.get("warmup_epochs", 0),
-                    milestones=expert_config["milestones"],
-                    gamma=expert_config["gamma"],
+                    warmup_epochs=expert_config.get("warmup_epochs", None),
+                    warmup_steps=expert_config.get("warmup_steps", None),
+                    milestones=expert_config.get("milestones", []),
+                    gamma=expert_config.get("gamma", 0.1),
                     use_cosine=expert_config.get("use_cosine", False),
                     total_epochs=expert_config["epochs"],
                 )
