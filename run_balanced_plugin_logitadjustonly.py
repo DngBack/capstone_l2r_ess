@@ -449,17 +449,32 @@ def plot_rc_dual(
     aurc_wst: float,
     out_path: Path,
 ):
+    # Prepare data for plotting: filter to <= 0.8 and ensure point at 0.8
+    max_rejection_plot = 0.8
+    mask_plot = r <= max_rejection_plot
+    r_plot = r[mask_plot].copy()
+    e_bal_plot = e_bal[mask_plot].copy()
+    e_wst_plot = e_wst[mask_plot].copy()
+    
+    # If the last point is less than 0.8, interpolate to add a point at exactly 0.8
+    if r_plot.size > 0 and r_plot[-1] < max_rejection_plot:
+        e_bal_at_08 = float(np.interp(max_rejection_plot, r, e_bal))
+        e_wst_at_08 = float(np.interp(max_rejection_plot, r, e_wst))
+        r_plot = np.append(r_plot, max_rejection_plot)
+        e_bal_plot = np.append(e_bal_plot, e_bal_at_08)
+        e_wst_plot = np.append(e_wst_plot, e_wst_at_08)
+    
     plt.figure(figsize=(7, 5))
-    plt.plot(r, e_bal, "o-", color="green", label=f"Balanced (AURC={aurc_bal:.4f})")
+    plt.plot(r_plot, e_bal_plot, "o-", color="green", label=f"Balanced (AURC={aurc_bal:.4f})")
     plt.plot(
-        r, e_wst, "s-", color="royalblue", label=f"Worst-group (AURC={aurc_wst:.4f})"
+        r_plot, e_wst_plot, "s-", color="royalblue", label=f"Worst-group (AURC={aurc_wst:.4f})"
     )
     plt.xlabel("Proportion of Rejections")
     plt.ylabel("Error")
     plt.title("Balanced and Worst-group Error vs Rejection Rate")
     plt.grid(True, alpha=0.3)
     plt.legend()
-    plt.xlim([0, 1])
+    plt.xlim([0, 0.8])
     ymax = 0.0
     if e_bal.size:
         ymax = max(ymax, float(e_bal.max()))
@@ -788,63 +803,63 @@ def main():
         gap_test[idx_t],
     )
 
+    # Filter to only include rejection rates <= 0.8 for AURC calculation
+    # and ensure we have a point at exactly 0.8 by interpolation if needed
+    max_rejection = 0.8
+    
+    # For val set
+    mask_val_aurc = r_val <= max_rejection
+    r_val_aurc = r_val[mask_val_aurc].copy()
+    e_val_aurc = e_val[mask_val_aurc].copy()
+    w_val_aurc = w_val[mask_val_aurc].copy()
+    
+    if r_val_aurc.size > 0 and r_val_aurc[-1] < max_rejection:
+        e_val_at_08 = float(np.interp(max_rejection, r_val, e_val))
+        w_val_at_08 = float(np.interp(max_rejection, r_val, w_val))
+        r_val_aurc = np.append(r_val_aurc, max_rejection)
+        e_val_aurc = np.append(e_val_aurc, e_val_at_08)
+        w_val_aurc = np.append(w_val_aurc, w_val_at_08)
+    
+    # For test set
+    mask_test_aurc = r_test <= max_rejection
+    r_test_aurc = r_test[mask_test_aurc].copy()
+    e_test_aurc = e_test[mask_test_aurc].copy()
+    w_test_aurc = w_test[mask_test_aurc].copy()
+    
+    if r_test_aurc.size > 0 and r_test_aurc[-1] < max_rejection:
+        e_test_at_08 = float(np.interp(max_rejection, r_test, e_test))
+        w_test_at_08 = float(np.interp(max_rejection, r_test, w_test))
+        r_test_aurc = np.append(r_test_aurc, max_rejection)
+        e_test_aurc = np.append(e_test_aurc, e_test_at_08)
+        w_test_aurc = np.append(w_test_aurc, w_test_at_08)
+    
+    # Calculate AURC from 0 to 0.8
     aurc_val_bal = (
-        float(np.trapz(e_val, r_val))
-        if r_val.size > 1
-        else float(e_val.mean() if e_val.size else 0.0)
+        float(np.trapz(e_val_aurc, r_val_aurc))
+        if r_val_aurc.size > 1
+        else float(e_val_aurc.mean() if e_val_aurc.size else 0.0)
     )
     aurc_test_bal = (
-        float(np.trapz(e_test, r_test))
-        if r_test.size > 1
-        else float(e_test.mean() if e_test.size else 0.0)
+        float(np.trapz(e_test_aurc, r_test_aurc))
+        if r_test_aurc.size > 1
+        else float(e_test_aurc.mean() if e_test_aurc.size else 0.0)
     )
     aurc_val_wst = (
-        float(np.trapz(w_val, r_val))
-        if r_val.size > 1
-        else float(w_val.mean() if w_val.size else 0.0)
+        float(np.trapz(w_val_aurc, r_val_aurc))
+        if r_val_aurc.size > 1
+        else float(w_val_aurc.mean() if w_val_aurc.size else 0.0)
     )
     aurc_test_wst = (
-        float(np.trapz(w_test, r_test))
-        if r_test.size > 1
-        else float(w_test.mean() if w_test.size else 0.0)
+        float(np.trapz(w_test_aurc, r_test_aurc))
+        if r_test_aurc.size > 1
+        else float(w_test_aurc.mean() if w_test_aurc.size else 0.0)
     )
-
-    # Practical AURC over coverage >= 0.2 → rejection <= 0.8
-    if r_val.size > 1:
-        mask_val_08 = r_val <= 0.8
-        aurc_val_bal_08 = (
-            float(np.trapz(e_val[mask_val_08], r_val[mask_val_08]))
-            if mask_val_08.sum() > 1
-            else float(e_val[mask_val_08].mean() if mask_val_08.any() else aurc_val_bal)
-        )
-        aurc_val_wst_08 = (
-            float(np.trapz(w_val[mask_val_08], r_val[mask_val_08]))
-            if mask_val_08.sum() > 1
-            else float(w_val[mask_val_08].mean() if mask_val_08.any() else aurc_val_wst)
-        )
-    else:
-        aurc_val_bal_08 = aurc_val_bal
-        aurc_val_wst_08 = aurc_val_wst
-
-    if r_test.size > 1:
-        mask_test_08 = r_test <= 0.8
-        aurc_test_bal_08 = (
-            float(np.trapz(e_test[mask_test_08], r_test[mask_test_08]))
-            if mask_test_08.sum() > 1
-            else float(
-                e_test[mask_test_08].mean() if mask_test_08.any() else aurc_test_bal
-            )
-        )
-        aurc_test_wst_08 = (
-            float(np.trapz(w_test[mask_test_08], r_test[mask_test_08]))
-            if mask_test_08.sum() > 1
-            else float(
-                w_test[mask_test_08].mean() if mask_test_08.any() else aurc_test_wst
-            )
-        )
-    else:
-        aurc_test_bal_08 = aurc_test_bal
-        aurc_test_wst_08 = aurc_test_wst
+    
+    # Keep old variable names for backward compatibility
+    aurc_val_bal_08 = aurc_val_bal
+    aurc_val_wst_08 = aurc_val_wst
+    aurc_test_bal_08 = aurc_test_bal
+    aurc_test_wst_08 = aurc_test_wst
 
     save_dict = {
         "objectives": ["balanced", "worst_group"],
@@ -902,17 +917,28 @@ def main():
 
     # Plot Tail - Head gap curve
     gap_plot_path = Path(CFG.results_dir) / "ltr_tail_minus_head_logitadjustonly_test.png"
+    # Prepare data for plotting: filter to <= 0.8 and ensure point at 0.8
+    max_rejection_plot = 0.8
+    mask_gap_plot = r_test <= max_rejection_plot
+    r_gap_plot = r_test[mask_gap_plot].copy()
+    gap_plot = gap_test[mask_gap_plot].copy()
+    
+    if r_gap_plot.size > 0 and r_gap_plot[-1] < max_rejection_plot:
+        gap_at_08 = float(np.interp(max_rejection_plot, r_test, gap_test))
+        r_gap_plot = np.append(r_gap_plot, max_rejection_plot)
+        gap_plot = np.append(gap_plot, gap_at_08)
+    
     plt.figure(figsize=(7, 5))
-    plt.plot(r_test, gap_test, "d-", color="crimson", label="Tail - Head error")
+    plt.plot(r_gap_plot, gap_plot, "d-", color="crimson", label="Tail - Head error")
     plt.xlabel("Proportion of Rejections")
     plt.ylabel("Tail Error - Head Error")
     plt.title("Tail-Head Error Gap vs Rejection Rate")
     plt.axhline(0.0, color="gray", linestyle="--", linewidth=1)
     plt.grid(True, alpha=0.3)
     plt.legend()
-    plt.xlim([0, 1])
-    ymin = float(min(0.0, gap_test.min() if gap_test.size else 0.0))
-    ymax = float(max(0.0, gap_test.max() if gap_test.size else 0.0))
+    plt.xlim([0, 0.8])
+    ymin = float(min(0.0, gap_plot.min() if gap_plot.size else 0.0))
+    ymax = float(max(0.0, gap_plot.max() if gap_plot.size else 0.0))
     pad = 0.05 * (ymax - ymin + 1e-8)
     plt.ylim([ymin - pad, ymax + pad])
     plt.tight_layout()
