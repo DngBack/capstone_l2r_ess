@@ -572,7 +572,7 @@ def train_gating(config: Dict):
     num_experts = len(config["experts"]["names"])
     num_classes = config["dataset"]["num_classes"]
 
-    print(f"\nCreating GatingNetwork:")
+    print("\nCreating GatingNetwork:")
     print(f"   Experts: {num_experts}")
     print(f"   Classes: {num_classes}")
     print(f"   Routing: {config['gating']['routing']}")
@@ -609,8 +609,8 @@ def train_gating(config: Dict):
         config["gating"]["use_load_balancing"]
         and config["gating"]["routing"] == "top_k"
     )
-    print(f"\nLoss Configuration:")
-    print(f"   Mixture NLL: ✓")
+    print("\nLoss Configuration:")
+    print("   Mixture NLL: ✓")
     print(f"   Load-balancing: {'✓' if use_lb else '✗ (disabled for dense routing)'}")
     print(f"   Entropy reg: {'✓' if config['gating']['use_entropy_reg'] else '✗'}")
     print(
@@ -813,7 +813,7 @@ def train_gating(config: Dict):
             history_serializable.append(serializable)
         json.dump(history_serializable, f, indent=2)
 
-    print(f"\nTraining completed!")
+    print("\nTraining completed!")
     print(f"   Best balanced acc: {best_balanced_acc:.4f}")
     print(f"   Best val loss: {best_val_loss:.4f}")
     print(f"   Checkpoints saved to: {checkpoint_dir}")

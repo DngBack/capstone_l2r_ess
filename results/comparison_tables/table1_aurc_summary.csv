@@ -1,0 +1,12 @@
+Method,Expert Type,Objective,AURC (Balanced),AURC (Worst-group)
+Uniform 2-Experts (Balanced),Ensemble 2-Experts,Balanced,0.2489,0.3215
+Uniform 2-Experts (Worst-group),Ensemble 2-Experts,Worst-group,0.2192,0.2295
+Uniform 3-Experts (Balanced),Ensemble 3-Experts,Balanced,0.2426,0.3633
+Uniform 3-Experts (Worst-group),Ensemble 3-Experts,Worst-group,0.2132,0.2189
+MoE (Gating) (Balanced),MoE (Gating),Balanced,0.2616,0.3062
+MoE (Gating) (Worst-group),MoE (Gating),Worst-group,0.2199,0.2329
+BalSoftmax-only (Balanced),Single (BalSoftmax),Balanced,0.2984,0.3271
+BalSoftmax-only (Worst-group),Single (BalSoftmax),Worst-group,0.2618,0.2694
+CE-only (Balanced),Single (CE),Balanced,0.2957,0.4171
+CE-only (Worst-group),Single (CE),Worst-group,0.2893,0.3212
+LogitAdjust-only (Balanced),Single (LogitAdjust),Balanced,0.3003,0.3566

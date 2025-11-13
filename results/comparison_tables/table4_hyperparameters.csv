@@ -1,0 +1,12 @@
+Method,α_head,α_tail,μ_head,μ_tail,λ (μ_tail - μ_head),β_head,β_tail
+CE-only (Balanced),1.6378,0.0445,0.00,20.00,20.00,N/A,N/A
+CE-only (Worst-group),0.8291,0.0236,0.00,11.25,11.25,0.0108,0.9892
+LogitAdjust-only (Balanced),1.6453,0.0453,0.00,20.50,20.50,N/A,N/A
+BalSoftmax-only (Balanced),1.6078,0.0452,0.00,20.00,20.00,N/A,N/A
+BalSoftmax-only (Worst-group),0.7737,0.0253,0.00,6.50,6.50,0.6848,0.3152
+Uniform 2-Experts (Balanced),0.0049,0.0006,0.00,11.00,11.00,N/A,N/A
+Uniform 3-Experts (Balanced),0.0000,0.0000,0.00,11.00,11.00,N/A,N/A
+Uniform 2-Experts (Worst-group),0.8101,0.0232,0.00,6.00,6.00,0.6977,0.3023
+Uniform 3-Experts (Worst-group),0.8046,0.0240,0.00,5.75,5.75,0.7562,0.2438
+MoE (Gating) (Balanced),1.6313,0.0444,0.00,21.00,21.00,N/A,N/A
+MoE (Gating) (Worst-group),0.8491,0.0207,0.00,6.00,6.00,0.3855,0.6145
