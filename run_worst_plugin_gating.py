@@ -680,7 +680,7 @@ def main():
     ew_plot = ew[mask_plot].copy()
     eb_plot = eb[mask_plot].copy()
     gap_plot = gap[mask_plot].copy()
-    
+
     # If the last point is less than 0.8, interpolate to add a point at exactly 0.8
     if r_plot.size > 0 and r_plot[-1] < max_rejection_plot:
         ew_at_08 = float(np.interp(max_rejection_plot, r, ew))
@@ -690,7 +690,7 @@ def main():
         ew_plot = np.append(ew_plot, ew_at_08)
         eb_plot = np.append(eb_plot, eb_at_08)
         gap_plot = np.append(gap_plot, gap_at_08)
-    
+
     plot_path = Path(CFG.results_dir) / "ltr_rc_curves_balanced_worst_gating_test.png"
     plot_rc(r_plot, ew_plot, eb_plot, aurc_w, aurc_b, plot_path)
     # Plot Tail - Head gap curve
