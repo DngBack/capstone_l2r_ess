@@ -13,7 +13,7 @@ class Expert(nn.Module):
     """
     
     def __init__(self, num_classes=100, backbone_name='cifar_resnet32', 
-                dropout_rate=0.0, init_weights=True):
+                dropout_rate=0.0, init_weights=True, pretrained=False):
         super(Expert, self).__init__()
         
         # Initialize backbone
@@ -28,13 +28,22 @@ class Expert(nn.Module):
         elif backbone_name == 'resnet50' or backbone_name == 'imagenet_resnet50':
             import torchvision.models as models
             # Load ResNet-50 from torchvision
-            self.backbone = models.resnet50(pretrained=False)
+            # Use pretrained weights if requested (recommended for ImageNet/iNaturalist)
+            self.backbone = models.resnet50(pretrained=pretrained)
             # Replace final classifier
             feature_dim = self.backbone.fc.in_features
             self.backbone.fc = nn.Identity()  # Remove default classifier
             self.fc = nn.Linear(feature_dim, num_classes)
-            # Skip initialization (handled above) for ResNet-50
-            init_weights = False
+            # Initialize classifier layer (always needed for new num_classes)
+            # If pretrained=True, backbone weights are pretrained but classifier is new
+            # If pretrained=False, both backbone and classifier need initialization
+            if pretrained:
+                # Initialize classifier with small weights when using pretrained backbone
+                self._initialize_classifier()
+            elif init_weights:
+                # Initialize both backbone and classifier if not pretrained
+                self._initialize_classifier()
+            init_weights = False  # Backbone weights already handled
         else:
             raise ValueError(f"Backbone '{backbone_name}' not recognized. "
                         f"Supported: 'cifar_resnet32', 'resnet32', 'resnet50', 'imagenet_resnet50'")

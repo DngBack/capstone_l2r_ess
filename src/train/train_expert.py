@@ -959,12 +959,19 @@ def train_single_expert(expert_key, use_expert_split=True, override_epochs=None,
     # Model and loss - get backbone from config if available
     backbone_name = CONFIG["dataset"].get("backbone", "cifar_resnet32")
     
+    # Use pretrained ResNet50 for ImageNet/iNaturalist datasets
+    use_pretrained = CONFIG["dataset"]["name"] in ["inaturalist2018", "imagenet_lt"]
+    
     model = Expert(
         num_classes=CONFIG["dataset"]["num_classes"],
         backbone_name=backbone_name,
         dropout_rate=expert_config["dropout_rate"],
         init_weights=True,
+        pretrained=use_pretrained,
     ).to(DEVICE)
+    
+    if use_pretrained:
+        print(f"[INFO] Using pretrained ResNet-50 backbone for {CONFIG['dataset']['name']}")
 
     criterion = get_loss_function(loss_type, train_loader)
     print(f"[SUCCESS] Loss Function: {type(criterion).__name__}")
