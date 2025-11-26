@@ -1,0 +1,28 @@
+mkdir ./data/imagenet_lt
+cd  ./data/imagenet_lt
+
+Link: https://drive.google.com/drive/u/0/folders/19cl6GK5B3p5CxzVBy5i4cWSmBy9-rT_-
+Get: ImageNet_LT_train.txt & ImageNet_LT_test.txt
+
+sed -Ei 's#val/n[0-9]+/#val/#' ImageNet_LT_test.txt
+
+mkdir train
+mkdir val
+
+aria2c -x 16 -s 16 https://image-net.org/data/ILSVRC/2012/ILSVRC2012_img_train.tar
+aria2c -x 16 -s 16 https://image-net.org/data/ILSVRC/2012/ILSVRC2012_img_val.tar
+
+tar -xvf /workspace/capstone_l2r_ess/data/imagenet_lt/ILSVRC2012_img_train.tar \
+    -C /workspace/capstone_l2r_ess/data/imagenet_lt/train
+
+tar -xvf /workspace/capstone_l2r_ess/data/imagenet_lt/ILSVRC2012_img_val.tar \
+    -C /workspace/capstone_l2r_ess/data/imagenet_lt/val
+
+cd /workspace/capstone_l2r_ess/data/imagenet_lt/train
+for tarfile in *.tar; do
+    foldername=${tarfile%.tar}
+    mkdir -p $foldername
+    tar -xf $tarfile -C $foldername
+    rm $tarfile
+done
+

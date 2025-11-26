@@ -1,17 +1,17 @@
 """
-Gating Network cho MAP (Mixture-Aware Plug-in) với L2R
-===========================================================
+Mixture-aware gating network used by the main Learning-to-Reject pipeline.
 
-Triển khai theo ý tưởng:
-1. Đầu vào: posteriors/logits đã calibrated + uncertainty/disagreement features
-2. Kiến trúc: MLP nông với LayerNorm (stable hơn BN cho batch nhỏ)
-3. Routing: Dense softmax (Jordan-Jacobs) hoặc Noisy Top-K (Shazeer et al.)
-4. Loss: Mixture NLL + Load-balancing (Switch Transformer)
+The module focuses on the routing component (a learned mixture-of-experts
+router) and exposes three steps:
+
+1. Feature extraction from expert posteriors (uncertainty + disagreement cues)
+2. A lightweight MLP that maps those features to unnormalized expert scores
+3. A routing policy (dense softmax or noisy top-k) that produces expert weights
 
 References:
-- Jordan & Jacobs (1994): Hierarchical Mixtures of Experts
-- Shazeer et al. (2017): Outrageously Large Neural Networks (Noisy Top-K)
-- Fedus et al. (2021): Switch Transformers (Load-balancing)
+- Jordan & Jacobs (1994) — Hierarchical Mixtures of Experts
+- Shazeer et al. (2017) — Outrageously Large Neural Networks
+- Fedus et al. (2021) — Switch Transformers
 """
 
 import torch
@@ -19,22 +19,91 @@ import torch.nn as nn
 import torch.nn.functional as F
 from typing import Dict, Tuple, Optional
 import numpy as np
+from dataclasses import dataclass
+
+
+@dataclass
+class GatingNetworkConfig:
+    """
+    Configuration block used to build the gating network end-to-end.
+
+    Attributes:
+        num_experts: Number of experts being routed.
+        num_classes: Number of classes/dimensions per expert posterior.
+        hidden_dims: Hidden sizes for the gating MLP.
+        dropout: Dropout applied after each hidden activation.
+        routing: Routing strategy (`dense` or `top_k`).
+        top_k: Number of experts to keep when routing='top_k'.
+        noise_std: Gaussian noise std for the noisy top-k router.
+        activation: Activation function for the MLP (`relu` or `gelu`).
+        normalize_features: Whether to layer-normalize concatenated features.
+    """
+
+    num_experts: int
+    num_classes: int
+    hidden_dims: Tuple[int, ...] = (256, 128)
+    dropout: float = 0.1
+    routing: str = 'dense'
+    top_k: int = 2
+    noise_std: float = 1.0
+    activation: str = 'relu'
+    normalize_features: bool = False
 
 
 # ============================================================================
 # FEATURE EXTRACTION
 # ============================================================================
 
+def _disagreement_ratio(top1_classes: torch.Tensor, dtype: torch.dtype, device: torch.device) -> torch.Tensor:
+    """
+    Compute normalized disagreement ratio per sample given top-1 predictions.
+
+    We keep the simple for-loop implementation because the number of experts E
+    is typically small (<=4) and the explicit version improves clarity during
+    presentations.
+    """
+    B, E = top1_classes.shape
+    ratios = torch.zeros(B, dtype=dtype, device=device)
+    denom = max(E - 1, 1)
+
+    for b in range(B):
+        unique_preds = torch.unique(top1_classes[b]).numel()
+        ratios[b] = (unique_preds - 1) / denom
+
+    return ratios
+
+
+def _mean_pairwise_kl(posteriors: torch.Tensor, eps: float) -> torch.Tensor:
+    """
+    Compute the mean KL divergence between every pair of expert posteriors.
+
+    This implementation vectorizes the pairwise computation and averages over
+    the upper triangular entries, leading to cleaner code than the previous
+    nested for-loops.
+    """
+    B, E, _ = posteriors.shape
+    if E <= 1:
+        return torch.zeros(B, device=posteriors.device, dtype=posteriors.dtype)
+
+    log_post = torch.log(posteriors + eps)
+    diff = log_post.unsqueeze(2) - log_post.unsqueeze(1)              # [B, E, E, C]
+    pairwise_kl = (posteriors.unsqueeze(2) * diff).sum(dim=-1)        # [B, E, E]
+
+    # Take strictly upper triangle to avoid double-counting/self terms
+    triu_indices = torch.triu_indices(E, E, offset=1, device=posteriors.device)
+    upper_vals = pairwise_kl[:, triu_indices[0], triu_indices[1]]     # [B, num_pairs]
+    mean_vals = upper_vals.mean(dim=-1)
+    return mean_vals
+
+
 class UncertaintyDisagreementFeatures:
     """
-    Tính các feature uncertainty và disagreement từ expert posteriors.
-    
-    Động cơ (từ Deep Ensembles):
-    - Entropy, disagreement tương quan mạnh với sai số
-    - Giúp router "biết khi nào nên dè chừng"
-    
-    References:
-    - Lakshminarayanan et al. (2017): Simple and Scalable Predictive Uncertainty Estimation
+    Compute per-expert and global uncertainty features from posteriors.
+
+    Motivated by ensemble uncertainty literature (e.g., Deep Ensembles), these
+    statistics highlight when the experts disagree and when each expert is
+    individually uncertain—both are strong predictors for when the router
+    should reduce confidence.
     """
     
     def __init__(self, num_experts: int):
@@ -58,15 +127,14 @@ class UncertaintyDisagreementFeatures:
         # 1. PER-EXPERT FEATURES
         # ====================================================================
         
-        # 1.1 Entropy của mỗi expert: H(p^(e))
-        # Cao → expert không chắc chắn
+        # 1.1 Per-expert entropy: H(p^(e)) — higher means lower confidence
         expert_entropy = -torch.sum(
             posteriors * torch.log(posteriors + eps), 
             dim=-1
         )  # [B, E]
         features['expert_entropy'] = expert_entropy
         
-        # 1.2 Confidence (max prob) của mỗi expert
+        # 1.2 Confidence (max probability) per expert
         expert_max_prob, _ = posteriors.max(dim=-1)  # [B, E]
         features['expert_confidence'] = expert_max_prob
         
@@ -75,74 +143,48 @@ class UncertaintyDisagreementFeatures:
         if top2_probs.size(-1) == 2:
             expert_margin = top2_probs[..., 0] - top2_probs[..., 1]  # [B, E]
         else:
-            expert_margin = top2_probs[..., 0]  # chỉ có 1 class
+            expert_margin = top2_probs[..., 0]  # single-class fallback
         features['expert_margin'] = expert_margin
         
         # ====================================================================
-        # 2. DISAGREEMENT FEATURES (giữa các experts)
+        # 2. DISAGREEMENT FEATURES (across experts)
         # ====================================================================
         
-        # 2.1 Tỉ lệ bất đồng top-1 prediction
+        # 2.1 Fraction of unique top-1 predictions (normalized)
         top1_classes = posteriors.argmax(dim=-1)  # [B, E]
-        # Đếm số lượng unique predictions cho mỗi sample
-        disagreement_ratio = []
-        for b in range(B):
-            unique_preds = torch.unique(top1_classes[b]).numel()
-            ratio = (unique_preds - 1) / max(E - 1, 1)  # normalize [0,1]
-            disagreement_ratio.append(ratio)
-        disagreement_ratio = torch.tensor(
-            disagreement_ratio, 
-            device=posteriors.device, 
-            dtype=posteriors.dtype
-        )  # [B]
+        disagreement_ratio = _disagreement_ratio(top1_classes, dtype=posteriors.dtype, device=posteriors.device)
         features['disagreement_ratio'] = disagreement_ratio
         
         # 2.2 Mean pairwise KL divergence
         # KL(p_i || p_j) averaged over all pairs
-        kl_sum = 0.0
-        count = 0
-        for i in range(E):
-            for j in range(i+1, E):
-                p_i = posteriors[:, i, :]  # [B, C]
-                p_j = posteriors[:, j, :]  # [B, C]
-                kl_ij = torch.sum(
-                    p_i * (torch.log(p_i + eps) - torch.log(p_j + eps)),
-                    dim=-1
-                )  # [B]
-                kl_sum += kl_ij
-                count += 1
-        
-        if count > 0:
-            mean_pairwise_kl = kl_sum / count  # [B]
-        else:
-            mean_pairwise_kl = torch.zeros(B, device=posteriors.device)
+        mean_pairwise_kl = _mean_pairwise_kl(posteriors, eps=eps)
         features['mean_pairwise_kl'] = mean_pairwise_kl
         
         # ====================================================================
         # 3. MIXTURE/ENSEMBLE FEATURES
         # ====================================================================
         
-        # 3.1 Uniform mixture (bootstrap estimate trước khi có gating weights)
-        # Note: Đây là heuristic để có ước lượng ban đầu về ensemble behavior
+        # 3.1 Uniform mixture (proxy before gating weights are known)
+        # Note: simple heuristic to estimate ensemble behavior up-front
         uniform_mixture = posteriors.mean(dim=1)  # [B, C]
         
-        # 3.2 Entropy của uniform mixture: H(uniform_η̃)
-        # Đây KHÔNG phải mixture thực (chưa có weights), chỉ là feature tham khảo
+        # 3.2 Entropy of the uniform mixture: H(uniform_η̃)
+        # Not the actual mixture—just a stabilizing feature for the router
         uniform_mixture_entropy = -torch.sum(
             uniform_mixture * torch.log(uniform_mixture + eps),
             dim=-1
         )  # [B]
         features['uniform_mixture_entropy'] = uniform_mixture_entropy
         
-        # 3.3 Variance của posteriors giữa các experts (trung bình theo class)
-        # Cao → experts bất đồng nhiều
+        # 3.3 Posterior variance across experts (averaged over classes)
+        # Higher variance implies larger disagreement
         posterior_variance = posteriors.var(dim=1)  # [B, C]
         mean_posterior_variance = posterior_variance.mean(dim=-1)  # [B]
         features['posterior_variance'] = mean_posterior_variance
         
         # 3.4 Mutual Information: I(Y; E | X) ≈ H(uniform_η̃) - mean(H(p^(e)))
-        # Cao → expert diversity có giá trị
-        # Note: Dùng uniform mixture vì chưa có gating weights
+        # Large MI indicates valuable expert diversity
+        # Note: still relies on uniform mixture because weights are unknown
         mean_expert_entropy = expert_entropy.mean(dim=-1)  # [B]
         mutual_info = uniform_mixture_entropy - mean_expert_entropy  # [B]
         features['mutual_information'] = mutual_info
@@ -152,10 +194,11 @@ class UncertaintyDisagreementFeatures:
 
 class GatingFeatureExtractor(nn.Module):
     """
-    Trích xuất và chuẩn hóa features cho gating network.
-    
-    Input: expert posteriors [B, E, C]
-    Output: concatenated feature vector [B, D]
+    Turn expert posteriors into a flattened, presentation-friendly feature vector.
+
+    The extractor concatenates the raw posteriors with several summary features
+    (entropy, margins, disagreement ratios, etc.) so that the downstream MLP can
+    operate on a fixed-size representation regardless of the number of classes.
     """
     
     def __init__(self, num_experts: int, num_classes: int, normalize_features: bool = False):  # ← Changed default to False
@@ -165,10 +208,10 @@ class GatingFeatureExtractor(nn.Module):
         self.normalize_features = normalize_features
         self.uncertainty_computer = UncertaintyDisagreementFeatures(num_experts)
         
-        # Tính output dimension
+        # Feature dimension bookkeeping
         # Posteriors: E*C
-        # Per-expert: 3*E (entropy, confidence, margin)
-        # Global: 5 (disagreement_ratio, mean_kl, uniform_mixture_entropy, posterior_var, mutual_info)
+        # Per-expert summaries: 3*E (entropy, confidence, margin)
+        # Global scalars: 5 (disagreement_ratio, mean_kl, uniform_mixture_entropy, posterior_var, mutual_info)
         self.feature_dim = (num_experts * num_classes +  # posteriors flattened
                            3 * num_experts +              # per-expert features
                            5)                             # global features
@@ -226,15 +269,14 @@ class GatingFeatureExtractor(nn.Module):
 
 class GatingMLP(nn.Module):
     """
-    MLP nông với LayerNorm (stable hơn BatchNorm cho batch nhỏ).
-    
+    Lightweight MLP with LayerNorm (more stable than BatchNorm for small batch sizes).
+
     Architecture:
-    - Input: features [B, D]
-    - Hidden: 2-3 layers với LayerNorm + ReLU + Dropout
-    - Output: logits [B, E] (before softmax/top-k)
-    
+        Input  -> Linear -> LayerNorm -> Activation -> Dropout (repeat)
+        Output -> Linear producing expert logits
+
     References:
-    - Ba et al. (2016): Layer Normalization (stable for small batches)
+        Ba et al. (2016): Layer Normalization
     """
     
     def __init__(
@@ -255,7 +297,7 @@ class GatingMLP(nn.Module):
         
         for hidden_dim in hidden_dims:
             layers.append(nn.Linear(in_dim, hidden_dim))
-            layers.append(nn.LayerNorm(hidden_dim))  # LayerNorm thay vì BN
+            layers.append(nn.LayerNorm(hidden_dim))
             
             if activation == 'relu':
                 layers.append(nn.ReLU(inplace=True))
@@ -273,12 +315,10 @@ class GatingMLP(nn.Module):
         layers.append(nn.Linear(in_dim, num_experts))
         
         self.mlp = nn.Sequential(*layers)
-        
-        # Initialize weights
         self._init_weights()
     
     def _init_weights(self):
-        """Khởi tạo trọng số (Xavier uniform)"""
+        """Weight initialization helper using Xavier uniform."""
         for m in self.modules():
             if isinstance(m, nn.Linear):
                 nn.init.xavier_uniform_(m.weight)
@@ -302,9 +342,7 @@ class GatingMLP(nn.Module):
 
 class DenseSoftmaxRouter(nn.Module):
     """
-    Dense routing: softmax(g(x))
-    
-    Cổ điển MoE (Jordan & Jacobs, 1994): tất cả experts được dùng.
+    Classic dense MoE routing: softmax(g(x)).
     """
     
     def forward(self, logits: torch.Tensor) -> torch.Tensor:
@@ -378,64 +416,82 @@ class NoisyTopKRouter(nn.Module):
 
 class GatingNetwork(nn.Module):
     """
-    Complete Gating Network cho MAP.
-    
-    Components:
-    1. Feature Extractor: posteriors → features
-    2. MLP: features → logits
-    3. Router: logits → weights
-    
+    Full gating stack = feature extractor + MLP + routing policy.
+
     Usage:
         gating = GatingNetwork(num_experts=3, num_classes=100, routing='dense')
         posteriors = expert_posteriors  # [B, E, C]
-        weights = gating(posteriors)    # [B, E]
+        weights, aux = gating(posteriors)
     """
     
     def __init__(
         self,
-        num_experts: int,
-        num_classes: int,
-        hidden_dims: list = [256, 128],
+        num_experts: Optional[int] = None,
+        num_classes: Optional[int] = None,
+        hidden_dims: Optional[list] = None,
         dropout: float = 0.1,
         routing: str = 'dense',  # 'dense' or 'top_k'
         top_k: int = 2,
         noise_std: float = 1.0,
-        activation: str = 'relu'
+        activation: str = 'relu',
+        normalize_features: bool = False,
+        config: Optional[GatingNetworkConfig] = None,
     ):
         super().__init__()
-        
-        self.num_experts = num_experts
-        self.num_classes = num_classes
-        self.routing_type = routing
-        
-        # 1. Feature extractor
-        self.feature_extractor = GatingFeatureExtractor(num_experts, num_classes)
-        
-        # 2. MLP
+
+        if config is None:
+            if num_experts is None or num_classes is None:
+                raise ValueError("Provide `config` or both `num_experts` and `num_classes`.")
+            hidden_dims = hidden_dims or [256, 128]
+            config = GatingNetworkConfig(
+                num_experts=num_experts,
+                num_classes=num_classes,
+                hidden_dims=tuple(hidden_dims),
+                dropout=dropout,
+                routing=routing,
+                top_k=top_k,
+                noise_std=noise_std,
+                activation=activation,
+                normalize_features=normalize_features,
+            )
+        else:
+            if any(param is not None for param in [num_experts, num_classes, hidden_dims]):
+                raise ValueError("When `config` is provided, omit legacy positional args.")
+
+        self.config = config
+        self.num_experts = config.num_experts
+        self.num_classes = config.num_classes
+        self.routing_type = config.routing
+
+        self.feature_extractor = GatingFeatureExtractor(
+            config.num_experts,
+            config.num_classes,
+            normalize_features=config.normalize_features,
+        )
+
         self.mlp = GatingMLP(
             input_dim=self.feature_extractor.feature_dim,
-            num_experts=num_experts,
-            hidden_dims=hidden_dims,
-            dropout=dropout,
-            activation=activation
+            num_experts=config.num_experts,
+            hidden_dims=list(config.hidden_dims),
+            dropout=config.dropout,
+            activation=config.activation,
         )
-        
-        # 3. Router
-        if routing == 'dense':
+
+        if config.routing == 'dense':
             self.router = DenseSoftmaxRouter()
-        elif routing == 'top_k':
-            self.router = NoisyTopKRouter(top_k=top_k, noise_std=noise_std)
+        elif config.routing == 'top_k':
+            self.router = NoisyTopKRouter(top_k=config.top_k, noise_std=config.noise_std)
         else:
-            raise ValueError(f"Unknown routing: {routing}")
+            raise ValueError(f"Unknown routing strategy: {config.routing}")
     
     def forward(self, posteriors: torch.Tensor) -> Tuple[torch.Tensor, Dict]:
         """
         Args:
-            posteriors: [B, E, C] expert posteriors (đã calibrated)
-        
+            posteriors: [B, E, C] expert posteriors (already temperature calibrated)
+
         Returns:
             weights: [B, E] gating weights (simplex)
-            aux_outputs: dict với các thông tin phụ (for loss computation)
+            aux_outputs: diagnostics (logits, features) for auxiliary losses
         """
         # Extract features
         features = self.feature_extractor(posteriors)  # [B, D]
@@ -460,12 +516,12 @@ class GatingNetwork(nn.Module):
         weights: Optional[torch.Tensor] = None
     ) -> torch.Tensor:
         """
-        Tính mixture posterior: η̃(x) = Σ_e w_e · p^(e)(y|x)
-        
+        Compute the mixture posterior η̃(x) = Σ_e w_e · p_e(y|x).
+
         Args:
-            posteriors: [B, E, C]
-            weights: [B, E] (nếu None, sẽ tính từ forward)
-        
+            posteriors: [B, E, C] expert posteriors
+            weights: [B, E] gating weights; recomputed if None
+
         Returns:
             mixture_posterior: [B, C]
         """
@@ -494,36 +550,31 @@ def compute_uncertainty_for_map(
     coeffs: Dict[str, float] = None
 ) -> torch.Tensor:
     """
-    Tính U(x) cho MAP margin: U(x) = a·H(w) + b·Disagree + d·H(η̃)
-    
+    Compute the composite uncertainty term used in the MAP margin:
+        U(x) = a · H(w) + b · Disagreement + d · H(η̃)
+
     Args:
-        posteriors: [B, E, C]
-        weights: [B, E]
-        mixture_posterior: [B, C] (nếu None sẽ tính)
-        coeffs: {'a': 1.0, 'b': 1.0, 'd': 1.0}
-    
+        posteriors: [B, E, C] expert posteriors
+        weights: [B, E] gating weights
+        mixture_posterior: [B, C] mixture; recomputed if None
+        coeffs: Optional dictionary overriding coefficients (defaults to 1.0)
+
     Returns:
-        U: [B] uncertainty scores
+        Tensor of shape [B] with per-sample uncertainty scores.
     """
     if coeffs is None:
         coeffs = {'a': 1.0, 'b': 1.0, 'd': 1.0}
     
     eps = 1e-8
-    B = posteriors.shape[0]
     
-    # 1. Entropy của gating weights: H(w)
+    # 1. Entropy of gating weights: H(w)
     H_w = -torch.sum(weights * torch.log(weights + eps), dim=-1)  # [B]
-    
-    # 2. Disagreement: tỉ lệ bất đồng top-1
+
+    # 2. Disagreement ratio using helper (keeps implementation consistent)
     top1_classes = posteriors.argmax(dim=-1)  # [B, E]
-    disagreement = []
-    for b in range(B):
-        unique = torch.unique(top1_classes[b]).numel()
-        ratio = (unique - 1) / max(posteriors.shape[1] - 1, 1)
-        disagreement.append(ratio)
-    disagree = torch.tensor(disagreement, device=posteriors.device, dtype=posteriors.dtype)
-    
-    # 3. Entropy của mixture: H(η̃)
+    disagree = _disagreement_ratio(top1_classes, dtype=posteriors.dtype, device=posteriors.device)
+
+    # 3. Entropy of mixture: H(η̃)
     if mixture_posterior is None:
         mixture_posterior = torch.sum(weights.unsqueeze(-1) * posteriors, dim=1)
     H_mix = -torch.sum(mixture_posterior * torch.log(mixture_posterior + eps), dim=-1)

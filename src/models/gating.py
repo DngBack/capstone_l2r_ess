@@ -55,10 +55,16 @@ class GatingFeatureBuilder:
         # Mixture / mean posterior entropy
         mean_entropy = -torch.sum(mean_posterior * torch.log(mean_posterior + 1e-8), dim=-1)  # [B]
         # Mean variance across classes (how much experts disagree on class probs)
-        class_var = expert_posteriors.var(dim=1)                     # [B, C]
-        mean_class_var = class_var.mean(dim=-1)                      # [B]
+        if E > 1:
+            class_var = expert_posteriors.var(dim=1, unbiased=False)   # [B, C]
+            mean_class_var = class_var.mean(dim=-1)                    # [B]
+        else:
+            mean_class_var = torch.zeros_like(mean_entropy)            # [B] - no variance with 1 expert
         # Std of expert max probabilities (confidence dispersion)
-        std_max_conf = max_probs.std(dim=-1)                         # [B]
+        if E > 1:
+            std_max_conf = max_probs.std(dim=-1, unbiased=False)       # [B]
+        else:
+            std_max_conf = torch.zeros_like(mean_entropy)              # [B] - no std with 1 expert
 
         # Concatenate per-expert features first (all [B,E])
         per_expert_feats = [entropy, topk_mass, residual_mass, max_probs, top_gap, cosine_sim, kl_to_mean]

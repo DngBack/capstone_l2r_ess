@@ -3,7 +3,7 @@
 Standalone Balanced Plug-in with Gating (3 Experts) per "Learning to Reject Meets Long-Tail Learning"
 =======================================================================================================
 
-- Loads CIFAR-100-LT splits and 3 expert logits (CE, LogitAdjust, BalSoftmax)
+- Loads CIFAR-100-LT/iNaturalist 2018 splits and expert logits
 - Loads trained gating network to combine experts
 - Builds head/tail groups from train class counts (tail <= 20 samples)
 - Implements Theorem 1 decision rules (classifier and rejector)
@@ -11,17 +11,22 @@ Standalone Balanced Plug-in with Gating (3 Experts) per "Learning to Reject Meet
 - Runs theory-compliant cost sweep: optimize (α, μ) per cost, one RC point per cost
 - Evaluates on test; computes balanced error RC and AURC; saves JSON and plots
 
+Usage:
+    python run_balanced_plugin_gating.py --dataset cifar100_lt_if100
+    python run_balanced_plugin_gating.py --dataset inaturalist2018
+
 Inputs (expected existing):
-- Splits dir: ./data/cifar100_lt_if100_splits_fixed/
-- Logits dir: ./outputs/logits/cifar100_lt_if100/{expert_name}/{split}_logits.pt
-- Gating checkpoint: ./checkpoints/gating_map/cifar100_lt_if100/final_gating.pth
-- Targets (if available): ./outputs/logits/cifar100_lt_if100/{expert_name}/{split}_targets.pt
+- Splits dir: ./data/{dataset_name}_splits/
+- Logits dir: ./outputs/logits/{dataset_name}/{expert_name}/{split}_logits.pt
+- Gating checkpoint: ./checkpoints/gating_map/{dataset_name}/final_gating.pth
+- Targets (if available): ./outputs/logits/{dataset_name}/{expert_name}/{split}_targets.pt
 
 Outputs:
-- results/ltr_plugin/cifar100_lt_if100/ltr_plugin_gating_balanced.json
-- results/ltr_plugin/cifar100_lt_if100/ltr_rc_curves_balanced_gating_test.png
+- results/ltr_plugin/{dataset_name}/ltr_plugin_gating_balanced.json
+- results/ltr_plugin/{dataset_name}/ltr_rc_curves_balanced_gating_test.png
 """
 
+import argparse
 import json
 from pathlib import Path
 from dataclasses import dataclass, field
@@ -32,6 +37,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import matplotlib.pyplot as plt
+import pandas as pd
 
 
 # ================================
@@ -88,8 +94,68 @@ class Config:
     seed: int = 42
 
 
-CFG = Config()
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+
+
+# Dataset configurations
+DATASET_CONFIGS = {
+    "cifar100_lt_if100": {
+        "splits_dir": "./data/cifar100_lt_if100_splits_fixed",
+        "logits_dir": "./outputs/logits/cifar100_lt_if100",
+        "gating_checkpoint": "./checkpoints/gating_map/cifar100_lt_if100/final_gating.pth",
+        "results_dir": "./results/ltr_plugin/cifar100_lt_if100",
+        "expert_names": ["ce_baseline", "logitadjust_baseline", "balsoftmax_baseline"],
+        "num_classes": 100,
+        "num_groups": 2,
+    },
+    "inaturalist2018": {
+        "splits_dir": "./data/inaturalist2018_splits",
+        "logits_dir": "./outputs/logits/inaturalist2018",
+        "gating_checkpoint": "./checkpoints/gating_map/inaturalist2018/final_gating.pth",
+        "results_dir": "./results/ltr_plugin/inaturalist2018",
+        "expert_names": ["ce_baseline", "logitadjust_baseline", "balsoftmax_baseline"],
+        "num_classes": 8142,
+        "num_groups": 2,
+    },
+    "imagenet_lt": {
+        "splits_dir": "./data/imagenet_lt_splits",
+        "logits_dir": "./outputs/logits/imagenet_lt",
+        "gating_checkpoint": "./checkpoints/gating_map/imagenet_lt/final_gating.pth",
+        "results_dir": "./results/ltr_plugin/imagenet_lt",
+        "expert_names": ["ce_baseline", "logitadjust_baseline", "balsoftmax_baseline"],
+        "num_classes": 1000,
+        "num_groups": 2,
+        "data_dir": "./data/imagenet_lt",
+        "train_label_file": "ImageNet_LT_train.txt",
+        "val_label_file": "ImageNet_LT_test.txt",
+    }
+}
+
+
+def setup_config(dataset_name: str) -> Config:
+    """Setup Config based on dataset selection."""
+    if dataset_name not in DATASET_CONFIGS:
+        raise ValueError(f"Unknown dataset: {dataset_name}. Choose from {list(DATASET_CONFIGS.keys())}")
+    
+    ds_config = DATASET_CONFIGS[dataset_name]
+    
+    # Create Config with dataset-specific settings
+    config = Config(
+        dataset_name=dataset_name,
+        splits_dir=ds_config["splits_dir"],
+        logits_dir=ds_config["logits_dir"],
+        gating_checkpoint=ds_config["gating_checkpoint"],
+        results_dir=ds_config["results_dir"],
+        expert_names=ds_config["expert_names"],
+        num_classes=ds_config["num_classes"],
+        num_groups=ds_config["num_groups"],
+    )
+    
+    return config
+
+
+# Default config (will be overridden by main)
+CFG = Config()
 
 
 # ================================
@@ -128,6 +194,14 @@ def load_labels(split: str, device: str = DEVICE) -> torch.Tensor:
         if isinstance(t, torch.Tensor):
             return t.to(device=device, dtype=torch.long)
 
+    # Fallback: load from JSON targets file (for iNaturalist/ImageNet-LT) or CIFAR-style loading
+    targets_file = Path(CFG.splits_dir) / f"{split}_targets.json"
+    if targets_file.exists():
+        # iNaturalist/ImageNet-LT: load targets from JSON
+        with open(targets_file, "r", encoding="utf-8") as f:
+            targets = json.load(f)
+        return torch.tensor(targets, dtype=torch.long, device=device)
+    
     # Fallback: reconstruct from CIFAR100 and indices
     import torchvision
 
@@ -665,9 +739,25 @@ def main():
     print("Loading S1 (tunev) and S2 (val) for selection/evaluation...")
     expert_logits_tunev = load_expert_logits(CFG.expert_names, "tunev", DEVICE)
     labels_tunev = load_labels("tunev", DEVICE)
+    
+    # Validate sizes match for tunev
+    if expert_logits_tunev.shape[0] != labels_tunev.shape[0]:
+        print(f"⚠️  WARNING: Size mismatch for tunev! Logits: {expert_logits_tunev.shape[0]}, Labels: {labels_tunev.shape[0]}")
+        min_size = min(expert_logits_tunev.shape[0], labels_tunev.shape[0])
+        print(f"    Truncating to {min_size} samples")
+        expert_logits_tunev = expert_logits_tunev[:min_size]
+        labels_tunev = labels_tunev[:min_size]
 
     expert_logits_val = load_expert_logits(CFG.expert_names, "val", DEVICE)
     labels_val = load_labels("val", DEVICE)
+    
+    # Validate sizes match for val
+    if expert_logits_val.shape[0] != labels_val.shape[0]:
+        print(f"⚠️  WARNING: Size mismatch for val! Logits: {expert_logits_val.shape[0]}, Labels: {labels_val.shape[0]}")
+        min_size = min(expert_logits_val.shape[0], labels_val.shape[0])
+        print(f"    Truncating to {min_size} samples")
+        expert_logits_val = expert_logits_val[:min_size]
+        labels_val = labels_val[:min_size]
 
     print("Computing mixture posteriors using gating network...")
     posterior_tunev = compute_mixture_posterior(expert_logits_tunev, gating, DEVICE)
@@ -682,6 +772,15 @@ def main():
     # Check baseline balanced error on test set
     expert_logits_test = load_expert_logits(CFG.expert_names, "test", DEVICE)
     labels_test = load_labels("test", DEVICE)
+    
+    # Validate sizes match
+    if expert_logits_test.shape[0] != labels_test.shape[0]:
+        print(f"⚠️  WARNING: Size mismatch! Logits: {expert_logits_test.shape[0]}, Labels: {labels_test.shape[0]}")
+        min_size = min(expert_logits_test.shape[0], labels_test.shape[0])
+        print(f"    Truncating to {min_size} samples")
+        expert_logits_test = expert_logits_test[:min_size]
+        labels_test = labels_test[:min_size]
+    
     posterior_test = compute_mixture_posterior(expert_logits_test, gating, DEVICE)
 
     # Compute baseline balanced error (no rejection) with importance weighting
@@ -1063,6 +1162,36 @@ def main():
     with open(out_json, "w", encoding="utf-8") as f:
         json.dump(save_dict, f, indent=2)
     print(f"Saved results to: {out_json}")
+    
+    # Export CSV for easy tracking
+    csv_data = []
+    for r in results_per_cost:
+        csv_data.append({
+            'target_rejection': r['target_rejection'],
+            'val_balanced_error': r['val_metrics']['balanced_error'],
+            'val_worst_group_error': r['val_metrics']['worst_group_error'],
+            'val_coverage': r['val_metrics']['coverage'],
+            'val_head_error': r['val_metrics']['group_errors'][0] if len(r['val_metrics']['group_errors']) >= 2 else None,
+            'val_tail_error': r['val_metrics']['group_errors'][1] if len(r['val_metrics']['group_errors']) >= 2 else None,
+            'val_tail_minus_head': r['val_metrics']['group_errors'][1] - r['val_metrics']['group_errors'][0] if len(r['val_metrics']['group_errors']) >= 2 else None,
+            'test_balanced_error': r['test_metrics']['balanced_error'],
+            'test_worst_group_error': r['test_metrics']['worst_group_error'],
+            'test_coverage': r['test_metrics']['coverage'],
+            'test_head_error': r['test_metrics']['group_errors'][0] if len(r['test_metrics']['group_errors']) >= 2 else None,
+            'test_tail_error': r['test_metrics']['group_errors'][1] if len(r['test_metrics']['group_errors']) >= 2 else None,
+            'test_tail_minus_head': r['test_metrics']['group_errors'][1] - r['test_metrics']['group_errors'][0] if len(r['test_metrics']['group_errors']) >= 2 else None,
+            'alpha_head': r['alpha'][0] if len(r['alpha']) >= 2 else None,
+            'alpha_tail': r['alpha'][1] if len(r['alpha']) >= 2 else None,
+            'mu_head': r['mu'][0] if len(r['mu']) >= 2 else None,
+            'mu_tail': r['mu'][1] if len(r['mu']) >= 2 else None,
+            'cost_val': r['cost_val'],
+            'cost_test': r['cost_test'],
+        })
+    
+    df = pd.DataFrame(csv_data)
+    csv_path = Path(CFG.results_dir) / "ltr_plugin_gating_balanced.csv"
+    df.to_csv(csv_path, index=False)
+    print(f"Saved CSV results to: {csv_path}")
 
     # Print AURCs
     print(f"Val AURC - Balanced: {aurc_val_bal:.4f} | Worst-group: {aurc_val_wst:.4f}")
@@ -1114,4 +1243,66 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    import sys
+    from datetime import datetime
+    
+    parser = argparse.ArgumentParser(description="Balanced L2R Plugin with Gating")
+    parser.add_argument(
+        "--dataset",
+        type=str,
+        default="cifar100_lt_if100",
+        choices=["cifar100_lt_if100", "inaturalist2018", "imagenet_lt"],
+        help="Dataset name"
+    )
+    parser.add_argument(
+        "--log-file",
+        type=str,
+        default=None,
+        help="Path to log file. If provided, all output will be saved to this file"
+    )
+    args = parser.parse_args()
+    
+    # Setup logging if log_file is provided
+    original_stdout = sys.stdout
+    log_file_handle = None
+    
+    if args.log_file:
+        log_path = Path(args.log_file)
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        log_file_handle = open(log_path, 'w', encoding='utf-8')
+        
+        # Create a class that writes to both stdout and log file
+        class TeeOutput:
+            def __init__(self, *files):
+                self.files = files
+            
+            def write(self, obj):
+                for f in self.files:
+                    f.write(obj)
+                    f.flush()
+            
+            def flush(self):
+                for f in self.files:
+                    f.flush()
+        
+        sys.stdout = TeeOutput(original_stdout, log_file_handle)
+        print(f"\n{'='*80}")
+        print(f"LOGGING TO FILE: {log_path}")
+        print(f"STARTED AT: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        print(f"{'='*80}\n")
+    
+    try:
+        # Setup config based on dataset
+        CFG = setup_config(args.dataset)
+        
+        print(f"✓ Using dataset: {args.dataset}")
+        print(f"  Classes: {CFG.num_classes}")
+        print(f"  Experts: {CFG.expert_names}")
+        
+        main()
+    finally:
+        # Restore stdout and close log file
+        if log_file_handle is not None:
+            sys.stdout = original_stdout
+            log_file_handle.close()
+            print(f"\n[Log saved to: {args.log_file}]")

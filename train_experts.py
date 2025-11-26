@@ -7,6 +7,7 @@ Trains all expert models (CE, LogitAdjust, BalancedSoftmax) for the AR-GSE ensem
 import sys
 import argparse
 from pathlib import Path
+from datetime import datetime
 
 # Add src to path to import modules
 sys.path.append(str(Path(__file__).parent / 'src'))
@@ -16,6 +17,14 @@ def parse_arguments():
     parser = argparse.ArgumentParser(
         description="Train expert models for AR-GSE ensemble",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter
+    )
+    
+    parser.add_argument(
+        '--dataset',
+        type=str,
+        choices=['cifar100_lt_if100', 'inaturalist2018', 'imagenet_lt'],
+        default='cifar100_lt_if100',
+        help='Dataset to train on (default: cifar100_lt_if100)'
     )
     
     parser.add_argument(
@@ -79,14 +88,15 @@ def parse_arguments():
     parser.add_argument(
         '--use-expert-split',
         action='store_true',
-        default=True,
-        help='Use expert split (90%% of train) for training (default: True)'
+        default=False,
+        help='Use expert split (90%% of train) for training. If not set, uses full train set (default: uses full train)'
     )
     
     parser.add_argument(
-        '--use-full-train',
-        action='store_true',
-        help='Use full training set instead of expert split'
+        '--log-file',
+        type=str,
+        default=None,
+        help='Path to log file. If provided, all output will be saved to this file'
     )
     
     return parser.parse_args()
@@ -94,8 +104,17 @@ def parse_arguments():
 def setup_training_environment(args):
     """Setup training environment and configurations."""
     try:
-        from src.train.train_expert import CONFIG
+        from src.train.train_expert import CONFIG, DATASET_CONFIGS
         import torch
+        
+        # Set CONFIG based on dataset argument
+        if hasattr(args, 'dataset') and args.dataset:
+            dataset_config = DATASET_CONFIGS[args.dataset]
+            CONFIG["dataset"].update(dataset_config)
+            print(f"✓ Using dataset: {args.dataset}")
+            print(f"  Classes: {dataset_config['num_classes']}")
+            print(f"  Backbone: {dataset_config['backbone']}")
+            print(f"  Batch size: {dataset_config['batch_size']}")
         
         # Setup device
         if args.device == 'auto':
@@ -146,7 +165,9 @@ def train_single_expert_wrapper(expert_key, args):
         from src.train.train_expert import train_single_expert
         
         # Determine which split to use
-        use_expert_split = not args.use_full_train  # Default True unless --use-full-train
+        # Default: use full train set (use_expert_split=False)
+        # If --use-expert-split flag is set, use expert split instead
+        use_expert_split = args.use_expert_split
         
         if args.verbose:
             print(f"\n📋 Training configuration for {expert_key}:")
@@ -161,7 +182,12 @@ def train_single_expert_wrapper(expert_key, args):
             print(f"    Using {'expert split (90% train)' if use_expert_split else 'full train'}")
             return f"checkpoints/experts/cifar100_lt_if100/{expert_key}_model.pth"
         
-        model_path = train_single_expert(expert_key, use_expert_split=use_expert_split)
+        model_path = train_single_expert(
+            expert_key, 
+            use_expert_split=use_expert_split,
+            override_epochs=args.epochs,
+            override_batch_size=args.batch_size
+        )
         return model_path
         
     except Exception as e:
@@ -171,28 +197,57 @@ def main():
     """Main function for expert training."""
     args = parse_arguments()
     
-    print("=" * 60)
-    print("AR-GSE EXPERT TRAINING")
-    print("=" * 60)
+    # Setup logging if log_file is provided
+    original_stdout = sys.stdout
+    log_file_handle = None
     
-    # Determine split usage
-    use_expert_split = not args.use_full_train
-    if use_expert_split:
-        print("📊 Training Mode: Using EXPERT split (90% of train)")
-        print("   - Trains on 9,719 samples (expert split)")
-        print("   - Validates on 1,000 samples (balanced val)")
-        print("   - Uses reweighted metrics for validation")
-    else:
-        print("📊 Training Mode: Using FULL train set")
-        print("   - Trains on 10,847 samples (full train)")
-        print("   - Validates on 1,000 samples (balanced val)")
-        print("   - Uses reweighted metrics for validation")
-    print()
-    
-    # Setup environment
-    setup_training_environment(args)
+    if args.log_file:
+        log_path = Path(args.log_file)
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        log_file_handle = open(log_path, 'w', encoding='utf-8')
+        
+        # Create a class that writes to both stdout and log file
+        class TeeOutput:
+            def __init__(self, *files):
+                self.files = files
+            
+            def write(self, obj):
+                for f in self.files:
+                    f.write(obj)
+                    f.flush()
+            
+            def flush(self):
+                for f in self.files:
+                    f.flush()
+        
+        sys.stdout = TeeOutput(original_stdout, log_file_handle)
+        print(f"\n{'='*80}")
+        print(f"LOGGING TO FILE: {log_path}")
+        print(f"STARTED AT: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        print(f"{'='*80}\n")
     
     try:
+        print("=" * 60)
+        print("AR-GSE EXPERT TRAINING")
+        print("=" * 60)
+        
+        # Determine split usage
+        use_expert_split = args.use_expert_split
+        if use_expert_split:
+            print("📊 Training Mode: Using EXPERT split (90% of train)")
+            print("   - Trains on expert split (90% of train set)")
+            print("   - Validates on balanced val set")
+            print("   - Uses reweighted metrics for validation")
+        else:
+            print("📊 Training Mode: Using FULL train set (default)")
+            print("   - Trains on full train set (100% of train)")
+            print("   - Validates on balanced val set")
+            print("   - Uses reweighted metrics for validation")
+        print()
+        
+        # Setup environment
+        setup_training_environment(args)
+        
         from src.train.train_expert import EXPERT_CONFIGS
         
         # Determine which experts to train
@@ -260,6 +315,12 @@ def main():
             print("Please check the errors above and resolve any issues")
             sys.exit(1)
             
+        if args.log_file:
+            print(f"\n{'='*80}")
+            print(f"COMPLETED AT: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+            print(f"LOG FILE SAVED: {args.log_file}")
+            print(f"{'='*80}")
+        
     except ImportError as e:
         print(f"\n❌ Error importing training modules: {e}")
         print("\nPlease ensure:")
@@ -278,6 +339,12 @@ def main():
             import traceback
             traceback.print_exc()
         sys.exit(1)
+    
+    finally:
+        # Restore stdout and close log file
+        if log_file_handle:
+            sys.stdout = original_stdout
+            log_file_handle.close()
 
 if __name__ == "__main__":
     main()
