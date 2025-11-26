@@ -591,6 +591,7 @@ def plot_rc(
     plt.title("Worst-group and Balanced Error vs Rejection Rate")
     plt.grid(True, alpha=0.3)
     plt.legend()
+    plt.xlim([0, 0.8])
     plt.tight_layout()
     plt.savefig(out_path, dpi=150, bbox_inches="tight")
     plt.close()
@@ -718,11 +719,36 @@ def main():
         else:
             gap.append(float("nan"))
     gap = np.array(gap)[idx]
+
+    # Filter to only include rejection rates <= 0.8 for AURC calculation
+    # and ensure we have a point at exactly 0.8 by interpolation if needed
+    max_rejection = 0.8
+    mask_aurc = r <= max_rejection
+    r_aurc = r[mask_aurc].copy()
+    ew_aurc = ew[mask_aurc].copy()
+    eb_aurc = eb[mask_aurc].copy()
+
+    # If the last point is less than 0.8, interpolate to add a point at exactly 0.8
+    if r_aurc.size > 0 and r_aurc[-1] < max_rejection:
+        # Use all original data (including points > 0.8) for interpolation
+        # to get accurate values at 0.8
+        ew_at_08 = float(np.interp(max_rejection, r, ew))
+        eb_at_08 = float(np.interp(max_rejection, r, eb))
+        # Append the interpolated point at 0.8
+        r_aurc = np.append(r_aurc, max_rejection)
+        ew_aurc = np.append(ew_aurc, ew_at_08)
+        eb_aurc = np.append(eb_aurc, eb_at_08)
+
+    # Calculate AURC from 0 to 0.8
     aurc_w = (
-        float(np.trapz(ew, r)) if r.size > 1 else float(ew.mean() if ew.size else 0.0)
+        float(np.trapz(ew_aurc, r_aurc))
+        if r_aurc.size > 1
+        else float(ew_aurc.mean() if ew_aurc.size else 0.0)
     )
     aurc_b = (
-        float(np.trapz(eb, r)) if r.size > 1 else float(eb.mean() if eb.size else 0.0)
+        float(np.trapz(eb_aurc, r_aurc))
+        if r_aurc.size > 1
+        else float(eb_aurc.mean() if eb_aurc.size else 0.0)
     )
 
     out_json = Path(CFG.results_dir) / "ltr_plugin_gating_worst.json"
@@ -746,21 +772,39 @@ def main():
             indent=2,
         )
 
+    # Prepare data for plotting: filter to <= 0.8 and ensure point at 0.8
+    max_rejection_plot = 0.8
+    mask_plot = r <= max_rejection_plot
+    r_plot = r[mask_plot].copy()
+    ew_plot = ew[mask_plot].copy()
+    eb_plot = eb[mask_plot].copy()
+    gap_plot = gap[mask_plot].copy()
+
+    # If the last point is less than 0.8, interpolate to add a point at exactly 0.8
+    if r_plot.size > 0 and r_plot[-1] < max_rejection_plot:
+        ew_at_08 = float(np.interp(max_rejection_plot, r, ew))
+        eb_at_08 = float(np.interp(max_rejection_plot, r, eb))
+        gap_at_08 = float(np.interp(max_rejection_plot, r, gap))
+        r_plot = np.append(r_plot, max_rejection_plot)
+        ew_plot = np.append(ew_plot, ew_at_08)
+        eb_plot = np.append(eb_plot, eb_at_08)
+        gap_plot = np.append(gap_plot, gap_at_08)
+
     plot_path = Path(CFG.results_dir) / "ltr_rc_curves_balanced_worst_gating_test.png"
-    plot_rc(r, ew, eb, aurc_w, aurc_b, plot_path)
+    plot_rc(r_plot, ew_plot, eb_plot, aurc_w, aurc_b, plot_path)
     # Plot Tail - Head gap curve
     gap_plot_path = Path(CFG.results_dir) / "ltr_tail_minus_head_worst_gating_test.png"
     plt.figure(figsize=(7, 5))
-    plt.plot(r, gap, "d-", color="crimson", label="Tail - Head error")
+    plt.plot(r_plot, gap_plot, "d-", color="crimson", label="Tail - Head error")
     plt.xlabel("Proportion of Rejections")
     plt.ylabel("Tail Error - Head Error")
     plt.title("Tail-Head Error Gap vs Rejection Rate (Worst Gating)")
     plt.axhline(0.0, color="gray", linestyle="--", linewidth=1)
     plt.grid(True, alpha=0.3)
     plt.legend()
-    plt.xlim([0, 1])
-    ymin = float(min(0.0, gap.min() if gap.size else 0.0))
-    ymax = float(max(0.0, gap.max() if gap.size else 0.0))
+    plt.xlim([0, 0.8])
+    ymin = float(min(0.0, gap_plot.min() if gap_plot.size else 0.0))
+    ymax = float(max(0.0, gap_plot.max() if gap_plot.size else 0.0))
     pad = 0.05 * (ymax - ymin + 1e-8)
     plt.ylim([ymin - pad, ymax + pad])
     plt.tight_layout()

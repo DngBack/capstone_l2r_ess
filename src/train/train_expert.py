@@ -16,6 +16,7 @@ from src.models.experts import Expert
 from src.models.losses import LogitAdjustLoss, BalancedSoftmaxLoss
 from src.metrics.calibration import TemperatureScaler
 from src.data.dataloader_utils import get_expert_training_dataloaders
+from src.data.groups import get_class_to_group_by_threshold
 
 # Import paper-compliant metrics (optional, for extended evaluation)
 # These functions are available from src.train.train_utils:
@@ -606,6 +607,10 @@ def validate_model(model, val_loader, device, class_weights=None, class_to_group
     if class_to_group is None:
         class_to_group = load_class_to_group(CONFIG["dataset"]["splits_dir"])
 
+    # Move class_to_group to device if provided
+    if class_to_group is not None:
+        class_to_group = class_to_group.to(device)
+
     with torch.no_grad():
         for inputs, targets in val_loader:
             inputs, targets = inputs.to(device), targets.to(device)
@@ -1041,6 +1046,10 @@ def train_single_expert(expert_key, use_expert_split=True, override_epochs=None,
         )
 
     # Note: Class weights removed - no reweighting during training/validation
+
+    # Build class-to-group mapping using threshold-based method (paper-compliant)
+    class_to_group = build_class_to_group(CONFIG["dataset"]["splits_dir"], threshold=20)
+    print("[SUCCESS] Built class-to-group mapping (threshold-based)")
 
     # Training setup
     best_val_acc = 0.0
