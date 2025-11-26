@@ -1130,13 +1130,13 @@ class LtRWorstGroupOptimizer:
         
         According to paper Algorithm 2:
         - S1: used for inner optimization (Algorithm 1)
-        - S2: used for estimating ê_k (group errors)
+        - S2: used for estimating e_k (group errors)
         
         Args:
             plugin: LtRPlugin instance
             mixture_posterior_s1: [B1, C] - S1 data for inner optimization
             labels_s1: [B1] - S1 labels
-            mixture_posterior_s2: [B2, C] - S2 data for estimating ê_k
+            mixture_posterior_s2: [B2, C] - S2 data for estimating e_k
             labels_s2: [B2] - S2 labels
             sample_weights_s1: [B1] optional - S1 sample weights
             sample_weights_s2: [B2] optional - S2 sample weights
@@ -1176,7 +1176,7 @@ class LtRWorstGroupOptimizer:
                 print(f"   Inner optimization result: α = {result.alpha}, μ = {result.mu}, cost = {result.cost:.4f}")
             
             # Compute group errors e_k^(t) on S2 using the (h^(t), r^(t)) from S1
-            # This follows the paper's requirement to use S2 for estimating ê_k
+            # This follows the paper's requirement to use S2 for estimating e_k
             plugin.set_parameters(
                 alpha=torch.tensor(result.alpha, dtype=torch.float32, device=mixture_posterior_s1.device),
                 mu=torch.tensor(result.mu, dtype=torch.float32, device=mixture_posterior_s1.device),
@@ -1240,8 +1240,8 @@ class LtRWorstGroupOptimizer:
         sample_weights_s2: Optional[torch.Tensor] = None
     ) -> np.ndarray:
         """
-        Compute group errors ê_k on S2, only on accepted samples
-        ê_k(h,r) = Σ_{(x,y)∈S2} 1{y ≠ h(x), y ∈ G_k, r(x) = 0} / Σ_{(x,y)∈S2} 1{y ∈ G_k, r(x) = 0}
+        Compute group errors e_k on S2, only on accepted samples
+        e_k(h,r) = Σ_{(x,y)∈S2} 1{y ≠ h(x), y ∈ G_k, r(x) = 0} / Σ_{(x,y)∈S2} 1{y ∈ G_k, r(x) = 0}
         """
         with torch.no_grad():
             predictions = plugin.predict_class(mixture_posterior_s2)
@@ -1260,7 +1260,7 @@ class LtRWorstGroupOptimizer:
                     errors_in_group = (predictions[accepted_in_group] != labels_s2[accepted_in_group]).sum().float()
                     total_accepted_in_group = accepted_in_group.sum().float()
                     
-                    # ê_k = errors / accepted_samples_in_group
+                    # e_k = errors / accepted_samples_in_group
                     group_error = (errors_in_group / total_accepted_in_group).item()
                 else:
                     # No accepted samples in group g → use smoothing to avoid NaN

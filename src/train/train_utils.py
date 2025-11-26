@@ -11,21 +11,16 @@ from typing import Dict
 
 def evaluate_metrics(model, dataloader, class_to_group, device):
     """
-    Tính balanced error và worst-group error theo paper - average of class-wise errors.
-    
+    Compute balanced and worst-group errors in the paper-defined manner.
+
     Args:
-        model: Model to evaluate
-        dataloader: DataLoader for evaluation
-        class_to_group: Tensor mapping class indices to group (0=head, 1=tail)
-        device: Device to use
-    
+        model: torch.nn.Module to evaluate.
+        dataloader: Dataloader that yields (inputs, labels).
+        class_to_group: Tensor mapping class indices to group ids (0=head, 1=tail).
+        device: torch device to run evaluation on.
+
     Returns:
-        Dictionary containing:
-        - balanced_error: Average of class-wise errors
-        - worst_group_error: Max of class-wise errors
-        - head_error: Error on head classes
-        - tail_error: Error on tail classes
-        - standard_acc: Standard accuracy
+        dict with balanced_error, worst_group_error, per-group errors and accuracy.
     """
     model.eval()
     all_preds = []
@@ -42,25 +37,25 @@ def evaluate_metrics(model, dataloader, class_to_group, device):
     all_preds = torch.cat(all_preds)
     all_targets = torch.cat(all_targets)
 
-    # Tính class-wise errors (theo paper định nghĩa)
+    # Class-wise errors (paper definition)
     class_errors = []
     for cls in range(100):
         cls_indices = all_targets == cls
-        if cls_indices.sum() > 0:  # Nếu có samples của class này
+        if cls_indices.sum() > 0:
             cls_error = (
                 (all_preds[cls_indices] != all_targets[cls_indices]).float().mean()
             )
             class_errors.append(cls_error.item())
         else:
-            class_errors.append(0.0)  # Nếu không có samples, error = 0
+            class_errors.append(0.0)
 
-    # Balanced Error = average of class-wise errors (theo paper)
+    # Balanced Error = average of class-wise errors
     balanced_error = np.mean(class_errors)
 
-    # Worst-group Error = max of class-wise errors (theo paper)
+    # Worst-group Error = max of class-wise errors
     worst_group_error = np.max(class_errors)
 
-    # Head/Tail errors (để so sánh và debug)
+    # Head/Tail errors (for diagnostics)
     head_indices = class_to_group[all_targets] == 0
     tail_indices = class_to_group[all_targets] == 1
 
@@ -89,15 +84,15 @@ def evaluate_metrics(model, dataloader, class_to_group, device):
 
 def compute_ece(probs, labels, n_bins=15):
     """
-    Compute Expected Calibration Error (ECE) using max prob (confidence) per sample.
-    
+    Compute Expected Calibration Error (ECE) using max probability per sample.
+
     Args:
-        probs: Tensor (N, num_classes) - softmax output.
-        labels: Tensor (N,) - ground truth indices.
-        n_bins: int - số lượng bins chia (M mặc định là 15).
-    
+        probs: Tensor (N, num_classes) with softmax outputs.
+        labels: Tensor (N,) containing ground-truth class indices.
+        n_bins: Number of histogram bins (default 15).
+
     Returns:
-        ece: float
+        float ECE value.
     """
     confidences, predictions = torch.max(probs, 1)
     accuracies = predictions.eq(labels)
