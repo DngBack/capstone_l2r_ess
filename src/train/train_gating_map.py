@@ -26,7 +26,7 @@ from datetime import datetime
 from typing import Dict, List, Tuple
 
 from src.models.gating_network_map import GatingNetwork, GatingMLP
-from src.models.gating import GatingFeatureBuilder
+from src.models.gating import GatingFeatureBuilder, FeatureConfig, FEATURE_PRESETS
 from src.models.gating_losses import GatingLoss, compute_gating_metrics
 
 
@@ -132,6 +132,12 @@ CONFIG = {
         "routing": "dense",  # 'dense' or 'top_k'
         "top_k": 2,
         "noise_std": 1.0,
+        # Feature selection (for ablation study)
+        # Options: "all", "per_expert_only", "global_only", "uncertainty_only",
+        #          "agreement_only", "minimal", "confidence_only", or None (use all)
+        "feature_preset": None,  # None = use all features, or specify preset name
+        # Or specify custom feature config (overrides preset):
+        "feature_config": None,  # Dict with feature flags, or None to use preset/all
         # Training
         "epochs": 100,
         "batch_size": 128,
@@ -222,7 +228,7 @@ def load_labels(splits_dir: str, split_name: str, device: str = "cpu") -> torch.
     # Try to load from targets file first (for iNaturalist)
     targets_file = f"{split_name}_targets.json"
     targets_path = Path(splits_dir) / targets_file
-    
+
     if targets_path.exists():
         # Load targets directly from JSON (iNaturalist)
         with open(targets_path, "r") as f:
@@ -259,7 +265,9 @@ def load_labels(splits_dir: str, split_name: str, device: str = "cpu") -> torch.
     return labels
 
 
-def load_class_weights(splits_dir: str, num_classes: int, device: str = "cpu") -> torch.Tensor:
+def load_class_weights(
+    splits_dir: str, num_classes: int, device: str = "cpu"
+) -> torch.Tensor:
     """
     Load class weights (frequency-based) cho reweighting.
 
@@ -320,10 +328,12 @@ def create_dataloaders(config: Dict) -> Tuple[DataLoader, DataLoader]:
     )
     print(f"    Train logits shape: {train_logits.shape}")
     print(f"    Train labels shape: {train_labels.shape}")
-    
+
     # Check size mismatch for train
     if train_logits.shape[0] != train_labels.shape[0]:
-        print(f"    ⚠️  WARNING: Size mismatch! Logits: {train_logits.shape[0]}, Labels: {train_labels.shape[0]}")
+        print(
+            f"    ⚠️  WARNING: Size mismatch! Logits: {train_logits.shape[0]}, Labels: {train_labels.shape[0]}"
+        )
         # Take minimum to avoid error
         min_size = min(train_logits.shape[0], train_labels.shape[0])
         print(f"    Truncating to {min_size} samples")
@@ -338,10 +348,12 @@ def create_dataloaders(config: Dict) -> Tuple[DataLoader, DataLoader]:
     print(f"    Val: {val_logits.shape[0]:,} samples")
     print(f"    Val logits shape: {val_logits.shape}")
     print(f"    Val labels shape: {val_labels.shape}")
-    
+
     # Check size mismatch
     if val_logits.shape[0] != val_labels.shape[0]:
-        print(f"    ⚠️  WARNING: Size mismatch! Logits: {val_logits.shape[0]}, Labels: {val_labels.shape[0]}")
+        print(
+            f"    ⚠️  WARNING: Size mismatch! Logits: {val_logits.shape[0]}, Labels: {val_labels.shape[0]}"
+        )
         # Take minimum to avoid error
         min_size = min(val_logits.shape[0], val_labels.shape[0])
         print(f"    Truncating to {min_size} samples")
@@ -370,6 +382,36 @@ def create_dataloaders(config: Dict) -> Tuple[DataLoader, DataLoader]:
     )
 
     return train_loader, val_loader
+
+
+# ============================================================================
+# FEATURE CONFIG HELPER
+# ============================================================================
+
+
+def _get_feature_config(config: Dict) -> FeatureConfig:
+    """
+    Parse feature config from training config dict.
+
+    Priority:
+    1. Custom feature_config dict (if provided)
+    2. Feature preset name (if provided)
+    3. Default (all features)
+    """
+    gating_config = config.get("gating", {})
+
+    # Check for custom feature_config dict
+    feature_config_dict = gating_config.get("feature_config")
+    if feature_config_dict is not None:
+        return FeatureConfig(**feature_config_dict)
+
+    # Check for preset name
+    preset_name = gating_config.get("feature_preset")
+    if preset_name is not None and preset_name in FEATURE_PRESETS:
+        return FEATURE_PRESETS[preset_name]
+
+    # Default: all features
+    return FeatureConfig()
 
 
 # ============================================================================
@@ -416,7 +458,9 @@ def train_one_epoch(
     ) * (epoch / gating_config["epochs"])
 
     # Prepare lightweight feature builder (reuse across batches)
-    feature_builder = GatingFeatureBuilder()
+    # Get feature config from config dict
+    feature_config = _get_feature_config(config)
+    feature_builder = GatingFeatureBuilder(feature_config=feature_config)
 
     for batch_idx, (logits, targets) in enumerate(train_loader):
         # logits: [B, E, C], targets: [B]
@@ -517,6 +561,7 @@ def validate(
     model: GatingNetwork,
     val_loader: DataLoader,
     loss_fn: GatingLoss,
+    config: Dict,
     class_weights: torch.Tensor = None,
 ) -> Dict[str, float]:
     """
@@ -534,7 +579,8 @@ def validate(
     all_targets = []
 
     # Prepare lightweight feature builder
-    feature_builder = GatingFeatureBuilder()
+    feature_config = _get_feature_config(config)
+    feature_builder = GatingFeatureBuilder(feature_config=feature_config)
 
     for logits, targets in val_loader:
         logits = logits.to(DEVICE)
@@ -634,7 +680,9 @@ def train_gating(config: Dict):
     # Class weights (for loss reweighting)
     class_weights = None
     if config["gating"]["use_class_weights"]:
-        class_weights = load_class_weights(config["dataset"]["splits_dir"], num_classes, DEVICE)
+        class_weights = load_class_weights(
+            config["dataset"]["splits_dir"], num_classes, DEVICE
+        )
         print(
             f"[OK] Loaded class weights (range: [{class_weights.min():.4f}, {class_weights.max():.4f}])"
         )
@@ -663,8 +711,13 @@ def train_gating(config: Dict):
     print(f"   Feature dim: {model.feature_extractor.feature_dim}")
 
     # Replace model MLP to match lightweight feature dimension from GatingFeatureBuilder
-    # GatingFeatureBuilder outputs D = 7*E + 3
-    lightweight_feature_dim = 7 * num_experts + 3
+    # Compute feature dimension based on feature config
+    feature_config = _get_feature_config(config)
+    lightweight_feature_dim = feature_config.compute_feature_dim(num_experts)
+
+    print(f"   Feature config: {feature_config}")
+    print(f"   Feature dim: {lightweight_feature_dim}")
+
     if hasattr(model, "mlp"):
         model.mlp = GatingMLP(
             input_dim=lightweight_feature_dim,
@@ -680,14 +733,18 @@ def train_gating(config: Dict):
         and config["gating"]["routing"] == "top_k"
     )
     print("\nLoss Configuration:")
-    print("   Mixture NLL: ✓")
-    print(f"   Load-balancing: {'✓' if use_lb else '✗ (disabled for dense routing)'}")
-    print(f"   Entropy reg: {'✓' if config['gating']['use_entropy_reg'] else '✗'}")
+    print("   Mixture NLL: [OK]")
     print(
-        f"   Responsibility loss: {'✓' if config['gating'].get('use_responsibility', False) else '✗'}"
+        f"   Load-balancing: {'[OK]' if use_lb else '[DISABLED] (disabled for dense routing)'}"
     )
     print(
-        f"   Prior regularizer: {'✓' if config['gating'].get('use_prior_reg', False) else '✗'}"
+        f"   Entropy reg: {'[OK]' if config['gating']['use_entropy_reg'] else '[DISABLED]'}"
+    )
+    print(
+        f"   Responsibility loss: {'[OK]' if config['gating'].get('use_responsibility', False) else '[DISABLED]'}"
+    )
+    print(
+        f"   Prior regularizer: {'[OK]' if config['gating'].get('use_prior_reg', False) else '[DISABLED]'}"
     )
     if use_lb:
         print(f"   λ_LB: {config['gating']['lambda_lb']}")
@@ -819,7 +876,7 @@ def train_gating(config: Dict):
         if (epoch + 1) % config["gating"]["val_interval"] == 0 or epoch == config[
             "gating"
         ]["epochs"] - 1:
-            val_metrics = validate(model, val_loader, loss_fn, class_weights)
+            val_metrics = validate(model, val_loader, loss_fn, config, class_weights)
 
             print(
                 f"  Val Loss: {val_metrics['loss']:.4f} (NLL={val_metrics['nll']:.4f})"
@@ -835,7 +892,13 @@ def train_gating(config: Dict):
                 best_balanced_acc = val_metrics["balanced_acc"]
                 best_val_loss = val_metrics["loss"]
 
-                save_path = checkpoint_dir / "best_gating.pth"
+                # Include feature preset in filename if specified
+                feature_preset = config["gating"].get("feature_preset")
+                if feature_preset:
+                    save_path = checkpoint_dir / f"best_gating_{feature_preset}.pth"
+                else:
+                    save_path = checkpoint_dir / "best_gating.pth"
+
                 torch.save(
                     {
                         "epoch": epoch,
@@ -855,7 +918,13 @@ def train_gating(config: Dict):
             )
 
     # Save final model
-    final_path = checkpoint_dir / "final_gating.pth"
+    # Include feature preset in filename if specified
+    feature_preset = config["gating"].get("feature_preset")
+    if feature_preset:
+        final_path = checkpoint_dir / f"final_gating_{feature_preset}.pth"
+    else:
+        final_path = checkpoint_dir / "final_gating.pth"
+
     torch.save(
         {
             "epoch": config["gating"]["epochs"],
@@ -903,7 +972,7 @@ def main():
         type=str,
         default="cifar100_lt_if100",
         choices=["cifar100_lt_if100", "inaturalist2018", "imagenet_lt"],
-        help="Dataset name"
+        help="Dataset name",
     )
     parser.add_argument(
         "--routing",
@@ -925,10 +994,18 @@ def main():
         "--lambda_h", type=float, default=0.01, help="Entropy regularization weight"
     )
     parser.add_argument(
+        "--feature-preset",
+        type=str,
+        default=None,
+        choices=list(FEATURE_PRESETS.keys()) + [None],
+        help="Feature preset name for ablation study. Options: "
+        + ", ".join(FEATURE_PRESETS.keys()),
+    )
+    parser.add_argument(
         "--log-file",
         type=str,
         default=None,
-        help="Path to log file. If provided, all output will be saved to this file"
+        help="Path to log file. If provided, all output will be saved to this file",
     )
 
     args = parser.parse_args()
@@ -936,40 +1013,63 @@ def main():
     # Setup logging if log_file is provided
     original_stdout = sys.stdout
     log_file_handle = None
-    
+
     if args.log_file:
         log_path = Path(args.log_file)
         log_path.parent.mkdir(parents=True, exist_ok=True)
-        log_file_handle = open(log_path, 'w', encoding='utf-8')
-        
+        log_file_handle = open(log_path, "w", encoding="utf-8")
+
         # Create a class that writes to both stdout and log file
         class TeeOutput:
             def __init__(self, *files):
                 self.files = files
-            
+
             def write(self, obj):
-                for f in self.files:
-                    f.write(obj)
-                    f.flush()
-            
+                # Write to stdout (may use default encoding, handle errors)
+                if len(self.files) > 0:
+                    try:
+                        self.files[0].write(obj)
+                        self.files[0].flush()
+                    except (UnicodeEncodeError, AttributeError):
+                        # Fallback: replace Unicode chars for stdout
+                        try:
+                            safe_obj = obj.encode("ascii", errors="replace").decode(
+                                "ascii"
+                            )
+                            self.files[0].write(safe_obj)
+                            self.files[0].flush()
+                        except Exception:
+                            pass  # Skip if still fails
+
+                # Write to log file (UTF-8, should handle all Unicode)
+                if len(self.files) > 1:
+                    try:
+                        self.files[1].write(obj)
+                        self.files[1].flush()
+                    except Exception:
+                        pass  # Skip if write fails
+
             def flush(self):
                 for f in self.files:
-                    f.flush()
-        
+                    try:
+                        f.flush()
+                    except Exception:
+                        pass
+
         sys.stdout = TeeOutput(original_stdout, log_file_handle)
-        print(f"\n{'='*80}")
+        print(f"\n{'=' * 80}")
         print(f"LOGGING TO FILE: {log_path}")
         print(f"STARTED AT: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-        print(f"{'='*80}\n")
-    
+        print(f"{'=' * 80}\n")
+
     try:
         # Update CONFIG based on dataset selection
         dataset_config = DATASET_CONFIGS_GATING[args.dataset]
         CONFIG["dataset"].update(dataset_config)
         CONFIG["experts"]["names"] = dataset_config["expert_names"]
         CONFIG["experts"]["logits_dir"] = dataset_config["logits_dir"]
-        
-        print(f"✓ Using dataset: {args.dataset}")
+
+        print(f"[OK] Using dataset: {args.dataset}")
         print(f"  Classes: {dataset_config['num_classes']}")
         print(f"  Experts: {dataset_config['expert_names']}")
 
@@ -982,11 +1082,16 @@ def main():
         CONFIG["gating"]["lambda_lb"] = args.lambda_lb
         CONFIG["gating"]["lambda_h"] = args.lambda_h
 
+        # Update feature preset if provided
+        if args.feature_preset:
+            CONFIG["gating"]["feature_preset"] = args.feature_preset
+            print(f"[OK] Using feature preset: {args.feature_preset}")
+
         # Train
         model, history = train_gating(CONFIG)
 
         print("\n🎉 Done!")
-    
+
     finally:
         # Restore stdout and close log file
         if log_file_handle is not None:

@@ -128,17 +128,19 @@ DATASET_CONFIGS = {
         "data_dir": "./data/imagenet_lt",
         "train_label_file": "ImageNet_LT_train.txt",
         "val_label_file": "ImageNet_LT_test.txt",
-    }
+    },
 }
 
 
 def setup_config(dataset_name: str) -> Config:
     """Setup Config based on dataset selection."""
     if dataset_name not in DATASET_CONFIGS:
-        raise ValueError(f"Unknown dataset: {dataset_name}. Choose from {list(DATASET_CONFIGS.keys())}")
-    
+        raise ValueError(
+            f"Unknown dataset: {dataset_name}. Choose from {list(DATASET_CONFIGS.keys())}"
+        )
+
     ds_config = DATASET_CONFIGS[dataset_name]
-    
+
     # Create Config with dataset-specific settings
     config = Config(
         dataset_name=dataset_name,
@@ -150,7 +152,7 @@ def setup_config(dataset_name: str) -> Config:
         num_classes=ds_config["num_classes"],
         num_groups=ds_config["num_groups"],
     )
-    
+
     return config
 
 
@@ -176,12 +178,12 @@ def load_expert_logits(
             raise FileNotFoundError(f"Missing logits: {path}")
         logits = torch.load(path, map_location=device).float()
         logits_list.append(logits)
-        print(f"  ✓ Loaded {expert_name}: {logits.shape}")
+        print(f"   Loaded {expert_name}: {logits.shape}")
 
     # Stack: [E, N, C] -> transpose to [N, E, C]
     logits = torch.stack(logits_list, dim=0).transpose(0, 1)
     print(
-        f"✓ Stacked expert logits: {logits.shape} (should be [N, {len(expert_names)}, {CFG.num_classes}])"
+        f" Stacked expert logits: {logits.shape} (should be [N, {len(expert_names)}, {CFG.num_classes}])"
     )
     return logits
 
@@ -201,7 +203,7 @@ def load_labels(split: str, device: str = DEVICE) -> torch.Tensor:
         with open(targets_file, "r", encoding="utf-8") as f:
             targets = json.load(f)
         return torch.tensor(targets, dtype=torch.long, device=device)
-    
+
     # Fallback: reconstruct from CIFAR100 and indices
     import torchvision
 
@@ -246,29 +248,18 @@ def load_class_weights(device: str = DEVICE) -> torch.Tensor:
     return torch.tensor(weights, dtype=torch.float32, device=device)
 
 
-def load_gating_network(device: str = DEVICE):  # Returns GatingNetwork
-    """Load trained gating network."""
+def load_gating_network(
+    device: str = DEVICE,
+):  # Returns tuple[GatingNetwork, FeatureConfig]
+    """Load trained gating network and its feature config."""
     from src.models.gating_network_map import GatingNetwork, GatingMLP
-    from src.models.gating import GatingFeatureBuilder
+    from src.models.gating import GatingFeatureBuilder, FeatureConfig, FEATURE_PRESETS
+    from src.train.train_gating_map import _get_feature_config
 
     num_experts = len(CFG.expert_names)
     num_classes = CFG.num_classes
 
     print(f"Loading gating network for {num_experts} experts: {CFG.expert_names}")
-
-    gating = GatingNetwork(
-        num_experts=num_experts, num_classes=num_classes, routing="dense"
-    ).to(device)
-
-    # Match compact feature setup used during training (GatingFeatureBuilder: D = 7*E + 3)
-    compact_dim = 7 * num_experts + 3
-    gating.mlp = GatingMLP(
-        input_dim=compact_dim,
-        num_experts=num_experts,
-        hidden_dims=[256, 128],
-        dropout=0.1,
-        activation='relu',
-    ).to(device)
 
     checkpoint_path = Path(CFG.gating_checkpoint)
     if not checkpoint_path.exists():
@@ -276,9 +267,54 @@ def load_gating_network(device: str = DEVICE):  # Returns GatingNetwork
 
     checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
 
+    # Load feature config from checkpoint (if available)
+    feature_config = None
+    if "config" in checkpoint:
+        saved_config = checkpoint["config"]
+        try:
+            feature_config = _get_feature_config(saved_config)
+            print(f" Loaded feature config from checkpoint: {feature_config}")
+        except Exception as e:
+            print(f"⚠️  Warning: Could not parse feature config from checkpoint: {e}")
+            print("   Using default feature config (all features)")
+
+    # Fallback to default if not found
+    if feature_config is None:
+        feature_config = FeatureConfig()
+        print(" Using default feature config (all features)")
+
+    # Compute feature dimension dynamically
+    compact_dim = feature_config.compute_feature_dim(num_experts)
+    print(
+        f" Feature dimension: {compact_dim} (per-expert: {len(feature_config.enabled_per_expert_features)}, global: {len(feature_config.enabled_global_features)})"
+    )
+
+    gating = GatingNetwork(
+        num_experts=num_experts, num_classes=num_classes, routing="dense"
+    ).to(device)
+
+    gating.mlp = GatingMLP(
+        input_dim=compact_dim,
+        num_experts=num_experts,
+        hidden_dims=[256, 128],
+        dropout=0.1,
+        activation="relu",
+    ).to(device)
+
     # Verify checkpoint matches expected number of experts
     if "model_state_dict" in checkpoint:
         state_dict = checkpoint["model_state_dict"]
+        # Check MLP input dimension from first layer weight
+        if "mlp.mlp.0.weight" in state_dict:
+            mlp_input_dim = state_dict["mlp.mlp.0.weight"].shape[1]
+            if mlp_input_dim != compact_dim:
+                print(
+                    f"⚠️  WARNING: Checkpoint MLP expects input_dim={mlp_input_dim}, but computed {compact_dim}"
+                )
+                print(
+                    f"   This may indicate feature config mismatch. Using computed dimension."
+                )
+
         # Check if mlp output layer has correct number of experts
         if (
             "mlp.mlp.8.weight" in state_dict
@@ -293,14 +329,15 @@ def load_gating_network(device: str = DEVICE):  # Returns GatingNetwork
     gating.load_state_dict(checkpoint["model_state_dict"])
     gating.eval()
 
-    print(f"✓ Loaded gating network from: {checkpoint_path}")
-    print(f"✓ Gating network configured for {num_experts} experts: {CFG.expert_names}")
-    return gating
+    print(f" Loaded gating network from: {checkpoint_path}")
+    print(f" Gating network configured for {num_experts} experts: {CFG.expert_names}")
+    return gating, feature_config
 
 
 def compute_mixture_posterior(
     expert_logits: torch.Tensor,
     gating_net,
+    feature_config=None,
     device: str = DEVICE,  # gating_net: GatingNetwork
 ) -> torch.Tensor:
     """Compute mixture posterior using gating network."""
@@ -309,8 +346,12 @@ def compute_mixture_posterior(
         # Convert logits to posteriors (for mixture) and build compact gating features
         expert_posteriors = F.softmax(expert_logits, dim=-1)  # [N, E, C]
         from src.models.gating import GatingFeatureBuilder
-        feat_builder = GatingFeatureBuilder()
-        features = feat_builder(expert_logits)                # [N, 7*E+3]
+
+        # Use feature_config if provided, otherwise default
+        feat_builder = GatingFeatureBuilder(feature_config=feature_config)
+        features = feat_builder(
+            expert_logits
+        )  # [N, D] where D depends on feature_config
 
         # Verify shape matches expected number of experts
         num_experts_logits = expert_logits.shape[1]
@@ -321,8 +362,8 @@ def compute_mixture_posterior(
             )
 
         # Get gating weights via mlp + router on compact features
-        gating_logits = gating_net.mlp(features)              # [N, E]
-        gating_weights = gating_net.router(gating_logits)     # [N, E]
+        gating_logits = gating_net.mlp(features)  # [N, E]
+        gating_weights = gating_net.router(gating_logits)  # [N, E]
 
         # Check for NaN
         if torch.isnan(gating_weights).any():
@@ -692,7 +733,7 @@ def plot_rc_dual(
     r_plot = r[mask_plot].copy()
     e_bal_plot = e_bal[mask_plot].copy()
     e_wst_plot = e_wst[mask_plot].copy()
-    
+
     # If the last point is less than 0.8, interpolate to add a point at exactly 0.8
     if r_plot.size > 0 and r_plot[-1] < max_rejection_plot:
         e_bal_at_08 = float(np.interp(max_rejection_plot, r, e_bal))
@@ -700,11 +741,17 @@ def plot_rc_dual(
         r_plot = np.append(r_plot, max_rejection_plot)
         e_bal_plot = np.append(e_bal_plot, e_bal_at_08)
         e_wst_plot = np.append(e_wst_plot, e_wst_at_08)
-    
+
     plt.figure(figsize=(7, 5))
-    plt.plot(r_plot, e_bal_plot, "o-", color="green", label=f"Balanced (AURC={aurc_bal:.4f})")
     plt.plot(
-        r_plot, e_wst_plot, "s-", color="royalblue", label=f"Worst-group (AURC={aurc_wst:.4f})"
+        r_plot, e_bal_plot, "o-", color="green", label=f"Balanced (AURC={aurc_bal:.4f})"
+    )
+    plt.plot(
+        r_plot,
+        e_wst_plot,
+        "s-",
+        color="royalblue",
+        label=f"Worst-group (AURC={aurc_wst:.4f})",
     )
     plt.xlabel("Proportion of Rejections")
     plt.ylabel("Error")
@@ -734,15 +781,17 @@ def main():
     ensure_dirs()
 
     print("Loading gating network...")
-    gating = load_gating_network(DEVICE)
+    gating, feature_config = load_gating_network(DEVICE)
 
     print("Loading S1 (tunev) and S2 (val) for selection/evaluation...")
     expert_logits_tunev = load_expert_logits(CFG.expert_names, "tunev", DEVICE)
     labels_tunev = load_labels("tunev", DEVICE)
-    
+
     # Validate sizes match for tunev
     if expert_logits_tunev.shape[0] != labels_tunev.shape[0]:
-        print(f"⚠️  WARNING: Size mismatch for tunev! Logits: {expert_logits_tunev.shape[0]}, Labels: {labels_tunev.shape[0]}")
+        print(
+            f"⚠️  WARNING: Size mismatch for tunev! Logits: {expert_logits_tunev.shape[0]}, Labels: {labels_tunev.shape[0]}"
+        )
         min_size = min(expert_logits_tunev.shape[0], labels_tunev.shape[0])
         print(f"    Truncating to {min_size} samples")
         expert_logits_tunev = expert_logits_tunev[:min_size]
@@ -750,18 +799,24 @@ def main():
 
     expert_logits_val = load_expert_logits(CFG.expert_names, "val", DEVICE)
     labels_val = load_labels("val", DEVICE)
-    
+
     # Validate sizes match for val
     if expert_logits_val.shape[0] != labels_val.shape[0]:
-        print(f"⚠️  WARNING: Size mismatch for val! Logits: {expert_logits_val.shape[0]}, Labels: {labels_val.shape[0]}")
+        print(
+            f"⚠️  WARNING: Size mismatch for val! Logits: {expert_logits_val.shape[0]}, Labels: {labels_val.shape[0]}"
+        )
         min_size = min(expert_logits_val.shape[0], labels_val.shape[0])
         print(f"    Truncating to {min_size} samples")
         expert_logits_val = expert_logits_val[:min_size]
         labels_val = labels_val[:min_size]
 
     print("Computing mixture posteriors using gating network...")
-    posterior_tunev = compute_mixture_posterior(expert_logits_tunev, gating, DEVICE)
-    posterior_val = compute_mixture_posterior(expert_logits_val, gating, DEVICE)
+    posterior_tunev = compute_mixture_posterior(
+        expert_logits_tunev, gating, feature_config, DEVICE
+    )
+    posterior_val = compute_mixture_posterior(
+        expert_logits_val, gating, feature_config, DEVICE
+    )
 
     print("Building class-to-group mapping (tail <= 20)...")
     class_to_group = build_class_to_group()
@@ -772,16 +827,20 @@ def main():
     # Check baseline balanced error on test set
     expert_logits_test = load_expert_logits(CFG.expert_names, "test", DEVICE)
     labels_test = load_labels("test", DEVICE)
-    
+
     # Validate sizes match
     if expert_logits_test.shape[0] != labels_test.shape[0]:
-        print(f"⚠️  WARNING: Size mismatch! Logits: {expert_logits_test.shape[0]}, Labels: {labels_test.shape[0]}")
+        print(
+            f"⚠️  WARNING: Size mismatch! Logits: {expert_logits_test.shape[0]}, Labels: {labels_test.shape[0]}"
+        )
         min_size = min(expert_logits_test.shape[0], labels_test.shape[0])
         print(f"    Truncating to {min_size} samples")
         expert_logits_test = expert_logits_test[:min_size]
         labels_test = labels_test[:min_size]
-    
-    posterior_test = compute_mixture_posterior(expert_logits_test, gating, DEVICE)
+
+    posterior_test = compute_mixture_posterior(
+        expert_logits_test, gating, feature_config, DEVICE
+    )
 
     # Compute baseline balanced error (no rejection) with importance weighting
     mix_pred_test = posterior_test.argmax(dim=-1)
@@ -931,7 +990,7 @@ def main():
         print(f"   Best alpha: {best['alpha']}")
         K_groups = int(class_to_group.max().item() + 1)
         print(
-            f"   Alpha sum: {np.sum(best['alpha']):.4f} (should be ≈ {K_groups * best['val_metrics']['coverage']:.4f})"
+            f"   Alpha sum: {np.sum(best['alpha']):.4f} (should be  {K_groups * best['val_metrics']['coverage']:.4f})"
         )
         print(f"   Alpha_hat (=alpha/K): {best['alpha'] / float(K_groups)}")
 
@@ -1071,33 +1130,33 @@ def main():
     # Filter to only include rejection rates <= 0.8 for AURC calculation
     # and ensure we have a point at exactly 0.8 by interpolation if needed
     max_rejection = 0.8
-    
+
     # For val set
     mask_val_aurc = r_val <= max_rejection
     r_val_aurc = r_val[mask_val_aurc].copy()
     e_val_aurc = e_val[mask_val_aurc].copy()
     w_val_aurc = w_val[mask_val_aurc].copy()
-    
+
     if r_val_aurc.size > 0 and r_val_aurc[-1] < max_rejection:
         e_val_at_08 = float(np.interp(max_rejection, r_val, e_val))
         w_val_at_08 = float(np.interp(max_rejection, r_val, w_val))
         r_val_aurc = np.append(r_val_aurc, max_rejection)
         e_val_aurc = np.append(e_val_aurc, e_val_at_08)
         w_val_aurc = np.append(w_val_aurc, w_val_at_08)
-    
+
     # For test set
     mask_test_aurc = r_test <= max_rejection
     r_test_aurc = r_test[mask_test_aurc].copy()
     e_test_aurc = e_test[mask_test_aurc].copy()
     w_test_aurc = w_test[mask_test_aurc].copy()
-    
+
     if r_test_aurc.size > 0 and r_test_aurc[-1] < max_rejection:
         e_test_at_08 = float(np.interp(max_rejection, r_test, e_test))
         w_test_at_08 = float(np.interp(max_rejection, r_test, w_test))
         r_test_aurc = np.append(r_test_aurc, max_rejection)
         e_test_aurc = np.append(e_test_aurc, e_test_at_08)
         w_test_aurc = np.append(w_test_aurc, w_test_at_08)
-    
+
     # Calculate AURC from 0 to 0.8
     aurc_val_bal = (
         float(np.trapz(e_val_aurc, r_val_aurc))
@@ -1119,7 +1178,7 @@ def main():
         if r_test_aurc.size > 1
         else float(w_test_aurc.mean() if w_test_aurc.size else 0.0)
     )
-    
+
     # Keep old variable names for backward compatibility
     aurc_val_bal_08 = aurc_val_bal
     aurc_val_wst_08 = aurc_val_wst
@@ -1162,32 +1221,48 @@ def main():
     with open(out_json, "w", encoding="utf-8") as f:
         json.dump(save_dict, f, indent=2)
     print(f"Saved results to: {out_json}")
-    
+
     # Export CSV for easy tracking
     csv_data = []
     for r in results_per_cost:
-        csv_data.append({
-            'target_rejection': r['target_rejection'],
-            'val_balanced_error': r['val_metrics']['balanced_error'],
-            'val_worst_group_error': r['val_metrics']['worst_group_error'],
-            'val_coverage': r['val_metrics']['coverage'],
-            'val_head_error': r['val_metrics']['group_errors'][0] if len(r['val_metrics']['group_errors']) >= 2 else None,
-            'val_tail_error': r['val_metrics']['group_errors'][1] if len(r['val_metrics']['group_errors']) >= 2 else None,
-            'val_tail_minus_head': r['val_metrics']['group_errors'][1] - r['val_metrics']['group_errors'][0] if len(r['val_metrics']['group_errors']) >= 2 else None,
-            'test_balanced_error': r['test_metrics']['balanced_error'],
-            'test_worst_group_error': r['test_metrics']['worst_group_error'],
-            'test_coverage': r['test_metrics']['coverage'],
-            'test_head_error': r['test_metrics']['group_errors'][0] if len(r['test_metrics']['group_errors']) >= 2 else None,
-            'test_tail_error': r['test_metrics']['group_errors'][1] if len(r['test_metrics']['group_errors']) >= 2 else None,
-            'test_tail_minus_head': r['test_metrics']['group_errors'][1] - r['test_metrics']['group_errors'][0] if len(r['test_metrics']['group_errors']) >= 2 else None,
-            'alpha_head': r['alpha'][0] if len(r['alpha']) >= 2 else None,
-            'alpha_tail': r['alpha'][1] if len(r['alpha']) >= 2 else None,
-            'mu_head': r['mu'][0] if len(r['mu']) >= 2 else None,
-            'mu_tail': r['mu'][1] if len(r['mu']) >= 2 else None,
-            'cost_val': r['cost_val'],
-            'cost_test': r['cost_test'],
-        })
-    
+        csv_data.append(
+            {
+                "target_rejection": r["target_rejection"],
+                "val_balanced_error": r["val_metrics"]["balanced_error"],
+                "val_worst_group_error": r["val_metrics"]["worst_group_error"],
+                "val_coverage": r["val_metrics"]["coverage"],
+                "val_head_error": r["val_metrics"]["group_errors"][0]
+                if len(r["val_metrics"]["group_errors"]) >= 2
+                else None,
+                "val_tail_error": r["val_metrics"]["group_errors"][1]
+                if len(r["val_metrics"]["group_errors"]) >= 2
+                else None,
+                "val_tail_minus_head": r["val_metrics"]["group_errors"][1]
+                - r["val_metrics"]["group_errors"][0]
+                if len(r["val_metrics"]["group_errors"]) >= 2
+                else None,
+                "test_balanced_error": r["test_metrics"]["balanced_error"],
+                "test_worst_group_error": r["test_metrics"]["worst_group_error"],
+                "test_coverage": r["test_metrics"]["coverage"],
+                "test_head_error": r["test_metrics"]["group_errors"][0]
+                if len(r["test_metrics"]["group_errors"]) >= 2
+                else None,
+                "test_tail_error": r["test_metrics"]["group_errors"][1]
+                if len(r["test_metrics"]["group_errors"]) >= 2
+                else None,
+                "test_tail_minus_head": r["test_metrics"]["group_errors"][1]
+                - r["test_metrics"]["group_errors"][0]
+                if len(r["test_metrics"]["group_errors"]) >= 2
+                else None,
+                "alpha_head": r["alpha"][0] if len(r["alpha"]) >= 2 else None,
+                "alpha_tail": r["alpha"][1] if len(r["alpha"]) >= 2 else None,
+                "mu_head": r["mu"][0] if len(r["mu"]) >= 2 else None,
+                "mu_tail": r["mu"][1] if len(r["mu"]) >= 2 else None,
+                "cost_val": r["cost_val"],
+                "cost_test": r["cost_test"],
+            }
+        )
+
     df = pd.DataFrame(csv_data)
     csv_path = Path(CFG.results_dir) / "ltr_plugin_gating_balanced.csv"
     df.to_csv(csv_path, index=False)
@@ -1217,12 +1292,12 @@ def main():
     mask_gap_plot = r_test <= max_rejection_plot
     r_gap_plot = r_test[mask_gap_plot].copy()
     gap_plot = gap_test[mask_gap_plot].copy()
-    
+
     if r_gap_plot.size > 0 and r_gap_plot[-1] < max_rejection_plot:
         gap_at_08 = float(np.interp(max_rejection_plot, r_test, gap_test))
         r_gap_plot = np.append(r_gap_plot, max_rejection_plot)
         gap_plot = np.append(gap_plot, gap_at_08)
-    
+
     plt.figure(figsize=(7, 5))
     plt.plot(r_gap_plot, gap_plot, "d-", color="crimson", label="Tail - Head error")
     plt.xlabel("Proportion of Rejections")
@@ -1245,60 +1320,72 @@ def main():
 if __name__ == "__main__":
     import sys
     from datetime import datetime
-    
+
     parser = argparse.ArgumentParser(description="Balanced L2R Plugin with Gating")
     parser.add_argument(
         "--dataset",
         type=str,
         default="cifar100_lt_if100",
         choices=["cifar100_lt_if100", "inaturalist2018", "imagenet_lt"],
-        help="Dataset name"
+        help="Dataset name",
+    )
+    parser.add_argument(
+        "--checkpoint",
+        type=str,
+        default=None,
+        help="Path to gating checkpoint file. If not provided, uses default from config.",
     )
     parser.add_argument(
         "--log-file",
         type=str,
         default=None,
-        help="Path to log file. If provided, all output will be saved to this file"
+        help="Path to log file. If provided, all output will be saved to this file",
     )
     args = parser.parse_args()
-    
+
     # Setup logging if log_file is provided
     original_stdout = sys.stdout
     log_file_handle = None
-    
+
     if args.log_file:
         log_path = Path(args.log_file)
         log_path.parent.mkdir(parents=True, exist_ok=True)
-        log_file_handle = open(log_path, 'w', encoding='utf-8')
-        
+        log_file_handle = open(log_path, "w", encoding="utf-8")
+
         # Create a class that writes to both stdout and log file
         class TeeOutput:
             def __init__(self, *files):
                 self.files = files
-            
+
             def write(self, obj):
                 for f in self.files:
                     f.write(obj)
                     f.flush()
-            
+
             def flush(self):
                 for f in self.files:
                     f.flush()
-        
+
         sys.stdout = TeeOutput(original_stdout, log_file_handle)
-        print(f"\n{'='*80}")
+        print(f"\n{'=' * 80}")
         print(f"LOGGING TO FILE: {log_path}")
         print(f"STARTED AT: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-        print(f"{'='*80}\n")
-    
+        print(f"{'=' * 80}\n")
+
     try:
         # Setup config based on dataset
         CFG = setup_config(args.dataset)
-        
-        print(f"✓ Using dataset: {args.dataset}")
+
+        # Override checkpoint path if provided
+        if args.checkpoint:
+            CFG.gating_checkpoint = args.checkpoint
+            print(f" Using custom checkpoint: {args.checkpoint}")
+
+        print(f" Using dataset: {args.dataset}")
         print(f"  Classes: {CFG.num_classes}")
         print(f"  Experts: {CFG.expert_names}")
-        
+        print(f"  Checkpoint: {CFG.gating_checkpoint}")
+
         main()
     finally:
         # Restore stdout and close log file
