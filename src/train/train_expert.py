@@ -1,9 +1,8 @@
 import torch
 import torch.optim as optim
 import torch.nn as nn
-from torch.utils.data import DataLoader, Subset
+from torch.utils.data import DataLoader
 import torchvision
-import torchvision.transforms as transforms
 import numpy as np
 import json
 import math
@@ -144,7 +143,7 @@ DATASET_CONFIGS = {
         "backbone": "resnet50",
         "batch_size": 512,
         "epochs": 200,
-    }
+    },
 }
 
 # --- GLOBAL CONFIGURATION ---
@@ -185,7 +184,7 @@ def get_dataloaders(use_expert_split=True, dataset_name=None, override_batch_siz
     # Use CONFIG dataset if not specified
     if dataset_name is None:
         dataset_name = CONFIG["dataset"]["name"]
-    
+
     if dataset_name == "cifar100_lt_if100":
         print("Loading CIFAR-100-LT datasets...")
 
@@ -194,7 +193,11 @@ def get_dataloaders(use_expert_split=True, dataset_name=None, override_batch_siz
         else:
             print("  Using FULL train split for training")
 
-        batch_size = override_batch_size if override_batch_size is not None else CONFIG["train_params"]["batch_size"]
+        batch_size = (
+            override_batch_size
+            if override_batch_size is not None
+            else CONFIG["train_params"]["batch_size"]
+        )
         train_loader, val_loader = get_expert_training_dataloaders(
             batch_size=batch_size,
             num_workers=4,
@@ -210,148 +213,50 @@ def get_dataloaders(use_expert_split=True, dataset_name=None, override_batch_siz
         )
 
         return train_loader, val_loader
-    
+
     elif dataset_name == "inaturalist2018":
         print("Loading iNaturalist 2018 datasets...")
-        
+
         # Import iNaturalist utilities
         from src.data.inaturalist2018_splits import (
-            INaturalistDataset, 
-            get_inaturalist_transforms
+            INaturalistDataset,
+            get_inaturalist_transforms,
         )
         from torch.utils.data import DataLoader
-        
+
         # Get dataset config
         ds_config = DATASET_CONFIGS["inaturalist2018"]
-        
+
         # Load train and val datasets with indices from splits
         train_transform, eval_transform = get_inaturalist_transforms()
-        
+
         # Load the full datasets
         full_train_dataset = INaturalistDataset(
-            ds_config["data_root"], 
+            ds_config["data_root"],
             ds_config["train_json"],
-            transform=None  # Will apply transform in DataLoader
+            transform=None,  # Will apply transform in DataLoader
         )
         full_val_dataset = INaturalistDataset(
-            ds_config["data_root"],
-            ds_config["val_json"],
-            transform=None
+            ds_config["data_root"], ds_config["val_json"], transform=None
         )
-        
+
         # Load split indices
         splits_dir = Path(ds_config["splits_dir"])
         if use_expert_split:
-            with open(splits_dir / "expert_indices.json", "r") as f:
+            expert_indices_path = splits_dir / "expert_indices.json"
+            if not expert_indices_path.exists():
+                raise FileNotFoundError(
+                    f"Expert indices file not found: {expert_indices_path}"
+                )
+            with open(expert_indices_path, "r") as f:
                 train_indices = json.load(f)
             print("  Using EXPERT split (90% of train) for training")
-        else:
-            with open(splits_dir / "train_class_counts.json", "r") as f:
-                train_class_counts = json.load(f)
-            # If no train_indices.json, create full indices
-            train_indices = list(range(len(full_train_dataset)))
-            print("  Using FULL train split for training")
-        
-        with open(splits_dir / "val_indices.json", "r") as f:
-            val_indices = json.load(f)
-        
-        # For iNaturalist, we need to adapt the approach
-        # Create a simple wrapper that applies transforms
-        class INaturalistSubset:
-            def __init__(self, base_dataset, indices, transform=None):
-                self.base_dataset = base_dataset
-                self.indices = indices
-                self.transform = transform
-            
-            def __len__(self):
-                return len(self.indices)
-            
-            def __getitem__(self, idx):
-                actual_idx = self.indices[idx]
-                img_path, label = self.base_dataset.samples[actual_idx]
-                from PIL import Image
-                image = Image.open(img_path).convert('RGB')
-                
-                if self.transform:
-                    image = self.transform(image)
-                    
-                return image, label
-        
-        train_dataset = INaturalistSubset(full_train_dataset, train_indices, train_transform)
-        val_dataset = INaturalistSubset(full_val_dataset, val_indices, eval_transform)
-        
-        # Create dataloaders - use override if provided, else use ds_config
-        batch_size = override_batch_size if override_batch_size is not None else ds_config["batch_size"]
-        train_loader = DataLoader(
-            train_dataset, 
-            batch_size=batch_size,
-            shuffle=True,
-            num_workers=8,
-            pin_memory=True,
-            drop_last=True
-        )
-        val_loader = DataLoader(
-            val_dataset,
-            batch_size=batch_size,
-            shuffle=False,
-            num_workers=8,
-            pin_memory=True,
-            drop_last=False
-        )
-        
-        print(
-            f"  Train loader: {len(train_loader)} batches ({len(train_dataset):,} samples)"
-        )
-        print(
-            f"  Val loader: {len(val_loader)} batches ({len(val_dataset):,} samples)"
-        )
-        
-        return train_loader, val_loader
-    
-    elif dataset_name == "imagenet_lt":
-        print("Loading ImageNet-LT datasets...")
-        
-        # Import ImageNet-LT utilities
-        from src.data.imagenet_lt_splits import (
-            ImageNetLTDataset, 
-            get_imagenet_lt_transforms
-        )
-        from torch.utils.data import DataLoader
-        
-        # Get dataset config
-        ds_config = DATASET_CONFIGS["imagenet_lt"]
-        
-        # Load train and val datasets with indices from splits
-        train_transform, eval_transform = get_imagenet_lt_transforms()
-        
-        # Load the full datasets
-        full_train_dataset = ImageNetLTDataset(
-            ds_config["data_dir"], 
-            ds_config["train_label_file"],
-            transform=None  # Will apply transform in DataLoader
-        )
-        full_val_dataset = ImageNetLTDataset(
-            ds_config["data_dir"],
-            ds_config["val_label_file"],
-            transform=None
-        )
-        
-        print(f"  Loaded train dataset: {len(full_train_dataset)} samples")
-        print(f"  Loaded val dataset: {len(full_val_dataset)} samples")
-        
-        # Load split indices
-        splits_dir = Path(ds_config["splits_dir"])
-        if use_expert_split:
-            # Use expert split (90% of train set)
-            with open(splits_dir / "expert_indices.json", "r") as f:
-                train_indices = json.load(f)
-            print(f"  Using EXPERT split (90% of train): {len(train_indices):,} samples")
         else:
             # Use full train set (100% of train set)
             # Option 1: Load all indices from expert + gating if available
             expert_indices_path = splits_dir / "expert_indices.json"
             gating_indices_path = splits_dir / "gating_indices.json"
-            
+
             if expert_indices_path.exists() and gating_indices_path.exists():
                 # Combine expert + gating to get full train
                 with open(expert_indices_path, "r") as f:
@@ -359,18 +264,181 @@ def get_dataloaders(use_expert_split=True, dataset_name=None, override_batch_siz
                 with open(gating_indices_path, "r") as f:
                     gating_indices = json.load(f)
                 train_indices = expert_indices + gating_indices
-                print(f"  Using FULL train split (expert + gating): {len(train_indices):,} samples")
+                print(
+                    f"  Using FULL train split (expert + gating): {len(train_indices):,} samples"
+                )
                 print(f"    Expert: {len(expert_indices):,} samples")
                 print(f"    Gating: {len(gating_indices):,} samples")
             else:
                 # Fallback: use all indices from dataset
                 train_indices = list(range(len(full_train_dataset)))
-                print(f"  Using FULL train split (all samples): {len(train_indices):,} samples")
-        
-        with open(splits_dir / "val_indices.json", "r") as f:
+                print(
+                    f"  Using FULL train split (all samples): {len(train_indices):,} samples"
+                )
+
+        val_indices_path = splits_dir / "val_indices.json"
+        if not val_indices_path.exists():
+            raise FileNotFoundError(
+                f"Validation indices file not found: {val_indices_path}"
+            )
+        with open(val_indices_path, "r") as f:
+            val_indices = json.load(f)
+
+        # For iNaturalist, we need to adapt the approach
+        # Create a simple wrapper that applies transforms
+        class INaturalistSubset:
+            def __init__(self, base_dataset, indices, transform=None):
+                self.base_dataset = base_dataset
+                # Validate and filter indices
+                max_idx = len(base_dataset.samples) - 1
+                valid_indices = [i for i in indices if 0 <= i <= max_idx]
+                if len(valid_indices) != len(indices):
+                    invalid_count = len(indices) - len(valid_indices)
+                    print(
+                        f"  Warning: {invalid_count} invalid indices filtered out (max valid index: {max_idx})"
+                    )
+                self.indices = valid_indices
+                self.transform = transform
+
+            def __len__(self):
+                return len(self.indices)
+
+            def __getitem__(self, idx):
+                if idx >= len(self.indices):
+                    raise IndexError(
+                        f"Index {idx} out of range for dataset of size {len(self.indices)}"
+                    )
+                actual_idx = self.indices[idx]
+                if actual_idx >= len(self.base_dataset.samples):
+                    raise IndexError(
+                        f"Actual index {actual_idx} out of range for base dataset of size {len(self.base_dataset.samples)}"
+                    )
+                img_path, label = self.base_dataset.samples[actual_idx]
+                from PIL import Image
+
+                try:
+                    image = Image.open(img_path).convert("RGB")
+                except Exception as e:
+                    print(f"Warning: Failed to load {img_path}: {e}")
+                    image = Image.new("RGB", (224, 224), color="black")
+
+                if self.transform:
+                    image = self.transform(image)
+
+                return image, label
+
+        train_dataset = INaturalistSubset(
+            full_train_dataset, train_indices, train_transform
+        )
+        val_dataset = INaturalistSubset(full_val_dataset, val_indices, eval_transform)
+
+        # Create dataloaders - use override if provided, else use ds_config
+        batch_size = (
+            override_batch_size
+            if override_batch_size is not None
+            else ds_config["batch_size"]
+        )
+        train_loader = DataLoader(
+            train_dataset,
+            batch_size=batch_size,
+            shuffle=True,
+            num_workers=8,
+            pin_memory=True,
+            drop_last=True,
+        )
+        val_loader = DataLoader(
+            val_dataset,
+            batch_size=batch_size,
+            shuffle=False,
+            num_workers=8,
+            pin_memory=True,
+            drop_last=False,
+        )
+
+        print(
+            f"  Train loader: {len(train_loader)} batches ({len(train_dataset):,} samples)"
+        )
+        print(f"  Val loader: {len(val_loader)} batches ({len(val_dataset):,} samples)")
+
+        return train_loader, val_loader
+
+    elif dataset_name == "imagenet_lt":
+        print("Loading ImageNet-LT datasets...")
+
+        # Import ImageNet-LT utilities
+        from src.data.imagenet_lt_splits import (
+            ImageNetLTDataset,
+            get_imagenet_lt_transforms,
+        )
+        from torch.utils.data import DataLoader
+
+        # Get dataset config
+        ds_config = DATASET_CONFIGS["imagenet_lt"]
+
+        # Load train and val datasets with indices from splits
+        train_transform, eval_transform = get_imagenet_lt_transforms()
+
+        # Load the full datasets
+        full_train_dataset = ImageNetLTDataset(
+            ds_config["data_dir"],
+            ds_config["train_label_file"],
+            transform=None,  # Will apply transform in DataLoader
+        )
+        full_val_dataset = ImageNetLTDataset(
+            ds_config["data_dir"], ds_config["val_label_file"], transform=None
+        )
+
+        print(f"  Loaded train dataset: {len(full_train_dataset)} samples")
+        print(f"  Loaded val dataset: {len(full_val_dataset)} samples")
+
+        # Load split indices
+        splits_dir = Path(ds_config["splits_dir"])
+        if use_expert_split:
+            # Use expert split (90% of train set)
+            expert_indices_path = splits_dir / "expert_indices.json"
+            if not expert_indices_path.exists():
+                raise FileNotFoundError(
+                    f"Expert indices file not found: {expert_indices_path}"
+                )
+            with open(expert_indices_path, "r") as f:
+                train_indices = json.load(f)
+            print(
+                f"  Using EXPERT split (90% of train): {len(train_indices):,} samples"
+            )
+        else:
+            # Use full train set (100% of train set)
+            # Option 1: Load all indices from expert + gating if available
+            expert_indices_path = splits_dir / "expert_indices.json"
+            gating_indices_path = splits_dir / "gating_indices.json"
+
+            if expert_indices_path.exists() and gating_indices_path.exists():
+                # Combine expert + gating to get full train
+                with open(expert_indices_path, "r") as f:
+                    expert_indices = json.load(f)
+                with open(gating_indices_path, "r") as f:
+                    gating_indices = json.load(f)
+                train_indices = expert_indices + gating_indices
+                print(
+                    f"  Using FULL train split (expert + gating): {len(train_indices):,} samples"
+                )
+                print(f"    Expert: {len(expert_indices):,} samples")
+                print(f"    Gating: {len(gating_indices):,} samples")
+            else:
+                # Fallback: use all indices from dataset
+                train_indices = list(range(len(full_train_dataset)))
+                print(
+                    f"  Using FULL train split (all samples): {len(train_indices):,} samples"
+                )
+
+        val_indices_path = splits_dir / "val_indices.json"
+        if not val_indices_path.exists():
+            raise FileNotFoundError(
+                f"Validation indices file not found: {val_indices_path}"
+            )
+        with open(val_indices_path, "r") as f:
             val_indices = json.load(f)
         print(f"  Using VAL split: {len(val_indices)} indices")
-        
+
         # Create a simple wrapper that applies transforms
         class ImageNetLTSubset:
             def __init__(self, base_dataset, indices, transform=None):
@@ -380,44 +448,57 @@ def get_dataloaders(use_expert_split=True, dataset_name=None, override_batch_siz
                 valid_indices = [i for i in indices if 0 <= i <= max_idx]
                 if len(valid_indices) != len(indices):
                     invalid_count = len(indices) - len(valid_indices)
-                    print(f"  Warning: {invalid_count} invalid indices filtered out (max valid index: {max_idx})")
+                    print(
+                        f"  Warning: {invalid_count} invalid indices filtered out (max valid index: {max_idx})"
+                    )
                 self.indices = valid_indices
                 self.transform = transform
-            
+
             def __len__(self):
                 return len(self.indices)
-            
+
             def __getitem__(self, idx):
                 if idx >= len(self.indices):
-                    raise IndexError(f"Index {idx} out of range for dataset of size {len(self.indices)}")
+                    raise IndexError(
+                        f"Index {idx} out of range for dataset of size {len(self.indices)}"
+                    )
                 actual_idx = self.indices[idx]
                 if actual_idx >= len(self.base_dataset.samples):
-                    raise IndexError(f"Actual index {actual_idx} out of range for base dataset of size {len(self.base_dataset.samples)}")
+                    raise IndexError(
+                        f"Actual index {actual_idx} out of range for base dataset of size {len(self.base_dataset.samples)}"
+                    )
                 img_path, label = self.base_dataset.samples[actual_idx]
                 from PIL import Image
+
                 try:
-                    image = Image.open(img_path).convert('RGB')
+                    image = Image.open(img_path).convert("RGB")
                 except Exception as e:
                     print(f"Warning: Failed to load {img_path}: {e}")
-                    image = Image.new('RGB', (224, 224), color='black')
-                
+                    image = Image.new("RGB", (224, 224), color="black")
+
                 if self.transform:
                     image = self.transform(image)
-                    
+
                 return image, label
-        
-        train_dataset = ImageNetLTSubset(full_train_dataset, train_indices, train_transform)
+
+        train_dataset = ImageNetLTSubset(
+            full_train_dataset, train_indices, train_transform
+        )
         val_dataset = ImageNetLTSubset(full_val_dataset, val_indices, eval_transform)
-        
+
         # Create dataloaders - use override if provided, else use ds_config
-        batch_size = override_batch_size if override_batch_size is not None else ds_config["batch_size"]
+        batch_size = (
+            override_batch_size
+            if override_batch_size is not None
+            else ds_config["batch_size"]
+        )
         train_loader = DataLoader(
-            train_dataset, 
+            train_dataset,
             batch_size=batch_size,
             shuffle=True,
             num_workers=8,
             pin_memory=True,
-            drop_last=True
+            drop_last=True,
         )
         val_loader = DataLoader(
             val_dataset,
@@ -425,18 +506,16 @@ def get_dataloaders(use_expert_split=True, dataset_name=None, override_batch_siz
             shuffle=False,
             num_workers=8,
             pin_memory=True,
-            drop_last=False
+            drop_last=False,
         )
-        
+
         print(
             f"  Train loader: {len(train_loader)} batches ({len(train_dataset):,} samples)"
         )
-        print(
-            f"  Val loader: {len(val_loader)} batches ({len(val_dataset):,} samples)"
-        )
-        
+        print(f"  Val loader: {len(val_loader)} batches ({len(val_dataset):,} samples)")
+
         return train_loader, val_loader
-    
+
     else:
         raise ValueError(f"Unsupported dataset: {dataset_name}")
 
@@ -483,7 +562,7 @@ def get_loss_function(loss_type, train_loader):
 def load_class_weights(splits_dir):
     """Load class weights for reweighted validation metrics."""
     weights_path = Path(splits_dir) / "class_weights.json"
-    
+
     # Get number of classes from CONFIG
     num_classes = CONFIG["dataset"]["num_classes"]
 
@@ -508,74 +587,83 @@ def load_class_weights(splits_dir):
 def load_class_to_group(splits_dir, threshold=20):
     """
     Load class-to-group mapping for head/tail classification.
-    
+
     IMPORTANT: Head/tail classification is ALWAYS based on TRAIN counts, not on val/test counts.
     This ensures consistency: a class that is head on train is head on val/test/tunev as well.
-    
+
     Args:
         splits_dir: Directory containing splits and class counts
         threshold: Threshold for head/tail classification (default: 20 samples)
-    
+
     Returns:
         class_to_group: Array mapping class -> group (0=head, 1=tail), based on TRAIN counts
     """
     splits_path = Path(splits_dir)
-    
+
     # Get number of classes from CONFIG
     num_classes = CONFIG["dataset"]["num_classes"]
-    
+
     # Try to load pre-computed class_to_group.json first (if available)
     group_path = splits_path / "class_to_group.json"
     if group_path.exists():
         print(f"Loading class_to_group from: {group_path}")
         with open(group_path, "r") as f:
             class_to_group = json.load(f)
-        
+
         # Convert to numpy array
         if isinstance(class_to_group, list):
             class_to_group = np.array(class_to_group, dtype=np.int64)
         else:
             # If it's a dict, convert to list
-            class_to_group = np.array([class_to_group.get(str(i), 0) for i in range(num_classes)], dtype=np.int64)
-        
+            class_to_group = np.array(
+                [class_to_group.get(str(i), 0) for i in range(num_classes)],
+                dtype=np.int64,
+            )
+
         # Verify it has correct length
         if len(class_to_group) != num_classes:
-            print(f"Warning: class_to_group has {len(class_to_group)} classes, expected {num_classes}")
+            print(
+                f"Warning: class_to_group has {len(class_to_group)} classes, expected {num_classes}"
+            )
             print("  Recomputing from train_class_counts.json...")
         else:
             num_head = (class_to_group == 0).sum()
             num_tail = (class_to_group == 1).sum()
-            print(f"  Loaded: {num_head} head classes, {num_tail} tail classes (based on train counts)")
+            print(
+                f"  Loaded: {num_head} head classes, {num_tail} tail classes (based on train counts)"
+            )
             return class_to_group
-    
+
     # Fallback: compute from train_class_counts.json
     counts_path = splits_path / "train_class_counts.json"
-    
+
     if not counts_path.exists():
         print(f"Warning: {counts_path} not found, using midpoint split")
         # Default: split at midpoint
         class_to_group = np.zeros(num_classes, dtype=np.int64)
-        class_to_group[num_classes // 2:] = 1
+        class_to_group[num_classes // 2 :] = 1
         return class_to_group
-    
+
     print(f"Loading train_class_counts from: {counts_path}")
     print(f"  Computing class_to_group based on train counts (threshold = {threshold})")
     with open(counts_path, "r") as f:
         class_counts = json.load(f)
-    
+
     if isinstance(class_counts, dict):
         class_counts = [class_counts.get(str(i), 0) for i in range(num_classes)]
-    
+
     counts = np.array(class_counts)
     tail_mask = counts <= threshold
     class_to_group = np.zeros(num_classes, dtype=np.int64)
     class_to_group[tail_mask] = 1  # 0=head, 1=tail
-    
+
     num_head = (class_to_group == 0).sum()
     num_tail = (class_to_group == 1).sum()
-    print(f"  Computed: {num_head} head classes, {num_tail} tail classes (based on train counts)")
+    print(
+        f"  Computed: {num_head} head classes, {num_tail} tail classes (based on train counts)"
+    )
     print(f"  IMPORTANT: This classification applies to ALL splits (val/test/tunev)")
-    
+
     return class_to_group
 
 
@@ -601,7 +689,7 @@ def validate_model(model, val_loader, device, class_weights=None, class_to_group
 
     group_correct = {"head": 0, "tail": 0}
     group_total = {"head": 0, "tail": 0}
-    
+
     # Load class_to_group if not provided
     if class_to_group is None:
         class_to_group = load_class_to_group(CONFIG["dataset"]["splits_dir"])
@@ -675,11 +763,12 @@ def export_logits_for_all_splits(model, expert_name):
         # Load indices
         with open(indices_path, "r") as f:
             indices = json.load(f)
-        
+
         # Create dataset based on type
         if dataset_name == "cifar100_lt_if100":
             # Use CIFAR transforms
             from src.data.enhanced_datasets import get_cifar100_transforms
+
             _, eval_transform = get_cifar100_transforms()
 
             # Load appropriate base dataset
@@ -691,80 +780,80 @@ def export_logits_for_all_splits(model, expert_name):
                 base_dataset = torchvision.datasets.CIFAR100(
                     root=CONFIG["dataset"]["data_root"], train=False, transform=None
                 )
-            
+
             from src.data.enhanced_datasets import CIFAR100LTDataset
+
             dataset = CIFAR100LTDataset(base_dataset, indices, eval_transform)
             loader = DataLoader(dataset, batch_size=512, shuffle=False, num_workers=4)
-            
+
         elif dataset_name == "inaturalist2018":
             # Use iNaturalist transforms
             from src.data.inaturalist2018_splits import (
                 INaturalistDataset,
-                get_inaturalist_transforms
+                get_inaturalist_transforms,
             )
+
             _, eval_transform = get_inaturalist_transforms()
-            
+
             # Determine which JSON file to use
             if split_name in ["train", "expert", "gating"]:
                 json_file = CONFIG["dataset"]["train_json"]
             else:
                 json_file = CONFIG["dataset"]["val_json"]
-            
+
             # Create full dataset first
             full_dataset = INaturalistDataset(
-                CONFIG["dataset"]["data_root"],
-                json_file,
-                transform=None
+                CONFIG["dataset"]["data_root"], json_file, transform=None
             )
-            
+
             # Create subset wrapper
             class INaturalistSubset:
                 def __init__(self, base_dataset, indices, transform=None):
                     self.base_dataset = base_dataset
                     self.indices = indices
                     self.transform = transform
-                
+
                 def __len__(self):
                     return len(self.indices)
-                
+
                 def __getitem__(self, idx):
                     actual_idx = self.indices[idx]
                     img_path, label = self.base_dataset.samples[actual_idx]
                     from PIL import Image
-                    image = Image.open(img_path).convert('RGB')
-                    
+
+                    image = Image.open(img_path).convert("RGB")
+
                     if self.transform:
                         image = self.transform(image)
-                        
+
                     return image, label
-            
+
             dataset = INaturalistSubset(full_dataset, indices, eval_transform)
             loader = DataLoader(dataset, batch_size=512, shuffle=False, num_workers=8)
-            
+
         elif dataset_name == "imagenet_lt":
             # Use ImageNet-LT transforms
             from src.data.imagenet_lt_splits import (
                 ImageNetLTDataset,
-                get_imagenet_lt_transforms
+                get_imagenet_lt_transforms,
             )
+
             _, eval_transform = get_imagenet_lt_transforms()
-            
+
             # Get dataset config
             ds_config = DATASET_CONFIGS["imagenet_lt"]
-            
+
             # Determine which label file to use
             if split_name in ["train", "expert", "gating"]:
                 label_file = ds_config["train_label_file"]
             else:
                 label_file = ds_config["val_label_file"]
-            
+
             # Create full dataset first
             full_dataset = ImageNetLTDataset(
-                ds_config["data_dir"],
-                label_file,
-                transform=None
+                ds_config["data_dir"], label_file, transform=None
             )
-            
+
             # Create subset wrapper (same as in get_dataloaders)
             class ImageNetLTSubset:
                 def __init__(self, base_dataset, indices, transform=None):
@@ -774,44 +863,55 @@ def export_logits_for_all_splits(model, expert_name):
                     valid_indices = [i for i in indices if 0 <= i <= max_idx]
                     if len(valid_indices) != len(indices):
                         invalid_count = len(indices) - len(valid_indices)
-                        print(f"    Warning: {invalid_count} invalid indices filtered out (max valid index: {max_idx})")
+                        print(
+                            f"    Warning: {invalid_count} invalid indices filtered out (max valid index: {max_idx})"
+                        )
                     self.indices = valid_indices
                     self.transform = transform
-                
+
                 def __len__(self):
                     return len(self.indices)
-                
+
                 def __getitem__(self, idx):
                     if idx >= len(self.indices):
-                        raise IndexError(f"Index {idx} out of range for dataset of size {len(self.indices)}")
+                        raise IndexError(
+                            f"Index {idx} out of range for dataset of size {len(self.indices)}"
+                        )
                     actual_idx = self.indices[idx]
                     if actual_idx >= len(self.base_dataset.samples):
-                        raise IndexError(f"Actual index {actual_idx} out of range for base dataset of size {len(self.base_dataset.samples)}")
+                        raise IndexError(
+                            f"Actual index {actual_idx} out of range for base dataset of size {len(self.base_dataset.samples)}"
+                        )
                     img_path, label = self.base_dataset.samples[actual_idx]
                     from PIL import Image
+
                     try:
-                        image = Image.open(img_path).convert('RGB')
+                        image = Image.open(img_path).convert("RGB")
                     except Exception as e:
                         print(f"    Warning: Failed to load {img_path}: {e}")
-                        image = Image.new('RGB', (224, 224), color='black')
-                    
+                        image = Image.new("RGB", (224, 224), color="black")
+
                     if self.transform:
                         image = self.transform(image)
-                        
+
                     return image, label
-            
+
             dataset = ImageNetLTSubset(full_dataset, indices, eval_transform)
             loader = DataLoader(dataset, batch_size=512, shuffle=False, num_workers=8)
-            
+
         else:
             raise ValueError(f"Unsupported dataset for export: {dataset_name}")
 
         # Export logits
-        print(f"  Dataset size: {len(dataset):,} samples (after filtering invalid indices)")
+        print(
+            f"  Dataset size: {len(dataset):,} samples (after filtering invalid indices)"
+        )
         print(f"  Original indices: {len(indices):,} samples")
         if len(dataset) != len(indices):
-            print(f"  ⚠️  WARNING: Dataset size ({len(dataset)}) != indices size ({len(indices)})")
-        
+            print(
+                f"  ⚠️  WARNING: Dataset size ({len(dataset)}) != indices size ({len(indices)})"
+            )
+
         all_logits = []
         with torch.no_grad():
             for inputs, _ in tqdm(loader, desc=f"Exporting {split_name}"):
@@ -821,10 +921,14 @@ def export_logits_for_all_splits(model, expert_name):
         all_logits = torch.cat(all_logits)
         actual_exported = all_logits.shape[0]
         torch.save(all_logits.to(torch.float16), output_dir / f"{split_name}_logits.pt")
-        print(f"  Exported {split_name}: {actual_exported:,} logits (dataset had {len(dataset):,} samples)")
-        
+        print(
+            f"  Exported {split_name}: {actual_exported:,} logits (dataset had {len(dataset):,} samples)"
+        )
+
         if actual_exported != len(dataset):
-            print(f"  ⚠️  WARNING: Exported {actual_exported} logits but dataset had {len(dataset)} samples!")
+            print(
+                f"  ⚠️  WARNING: Exported {actual_exported} logits but dataset had {len(dataset)} samples!"
+            )
 
     print(f"[SUCCESS] All logits exported to: {output_dir}")
 
@@ -833,7 +937,16 @@ def export_logits_for_all_splits(model, expert_name):
 
 
 def get_manual_lr(
-    epoch, iteration, total_iters_per_epoch, base_lr, warmup_epochs=None, warmup_steps=None, milestones=None, gamma=0.1, use_cosine=False, total_epochs=None
+    epoch,
+    iteration,
+    total_iters_per_epoch,
+    base_lr,
+    warmup_epochs=None,
+    warmup_steps=None,
+    milestones=None,
+    gamma=0.1,
+    use_cosine=False,
+    total_epochs=None,
 ):
     """
     Manual LR scheduling theo paper specifications.
@@ -859,7 +972,7 @@ def get_manual_lr(
     """
     milestones = milestones or []
     current_iteration = epoch * total_iters_per_epoch + iteration
-    
+
     # Warmup: linear warmup to reach base_lr
     # Priority: warmup_epochs > warmup_steps
     if warmup_epochs is not None:
@@ -882,7 +995,7 @@ def get_manual_lr(
         # Calculate decay factor based on how many milestones we've passed
         decay_count = sum(1 for m in milestones if epoch >= m)
         current_base_lr = base_lr * (gamma**decay_count)
-    
+
     # Step 2: Apply cosine annealing if enabled
     if use_cosine and total_epochs:
         # Cosine annealing: apply cosine from after warmup to end of training
@@ -893,10 +1006,12 @@ def get_manual_lr(
             # Only use warmup_steps if warmup_epochs is not specified
             # If warmup_steps, warmup ends very early (5 iterations), so start cosine from epoch 0
             warmup_epochs_used = 0
-        
+
         # Calculate cosine progress from warmup end to total epochs
         if epoch >= warmup_epochs_used:
-            progress = (epoch - warmup_epochs_used) / (total_epochs - warmup_epochs_used)
+            progress = (epoch - warmup_epochs_used) / (
+                total_epochs - warmup_epochs_used
+            )
             # Clamp progress to [0, 1] to avoid issues
             progress = min(max(progress, 0.0), 1.0)
             lr = current_base_lr * 0.5 * (1 + math.cos(math.pi * progress))
@@ -904,12 +1019,14 @@ def get_manual_lr(
             # Should not reach here if warmup logic is correct, but just in case
             lr = current_base_lr
         return lr
-    
+
     # Default: only step decay (no cosine)
     return current_base_lr
 
 
-def train_single_expert(expert_key, use_expert_split=True, override_epochs=None, override_batch_size=None):
+def train_single_expert(
+    expert_key, use_expert_split=True, override_epochs=None, override_batch_size=None
+):
     """
     Train a single expert based on its configuration.
 
@@ -923,20 +1040,24 @@ def train_single_expert(expert_key, use_expert_split=True, override_epochs=None,
     dataset_name = CONFIG["dataset"]["name"]
     if dataset_name in ["inaturalist2018", "imagenet_lt"]:
         if expert_key not in EXPERT_CONFIGS_INATURALIST:
-            raise ValueError(f"Expert '{expert_key}' not found in EXPERT_CONFIGS_INATURALIST")
+            raise ValueError(
+                f"Expert '{expert_key}' not found in EXPERT_CONFIGS_INATURALIST"
+            )
         expert_configs = EXPERT_CONFIGS_INATURALIST
     else:
         if expert_key not in EXPERT_CONFIGS:
             raise ValueError(f"Expert '{expert_key}' not found in EXPERT_CONFIGS")
         expert_configs = EXPERT_CONFIGS
-    
-    expert_config = expert_configs[expert_key].copy()  # Make a copy to avoid modifying original
-    
+
+    expert_config = expert_configs[
+        expert_key
+    ].copy()  # Make a copy to avoid modifying original
+
     # Apply overrides
     if override_epochs is not None:
         expert_config["epochs"] = override_epochs
         print(f"[OVERRIDE] Epochs set to {override_epochs}")
-    
+
     expert_name = expert_config["name"]
     loss_type = expert_config["loss_type"]
 
@@ -953,15 +1074,15 @@ def train_single_expert(expert_key, use_expert_split=True, override_epochs=None,
     train_loader, val_loader = get_dataloaders(
         use_expert_split=use_expert_split,
         dataset_name=CONFIG["dataset"]["name"],
-        override_batch_size=override_batch_size
+        override_batch_size=override_batch_size,
     )
 
     # Model and loss - get backbone from config if available
     backbone_name = CONFIG["dataset"].get("backbone", "cifar_resnet32")
-    
+
     # Use pretrained ResNet50 for ImageNet/iNaturalist datasets
     use_pretrained = CONFIG["dataset"]["name"] in ["inaturalist2018", "imagenet_lt"]
-    
+
     model = Expert(
         num_classes=CONFIG["dataset"]["num_classes"],
         backbone_name=backbone_name,
@@ -969,9 +1090,11 @@ def train_single_expert(expert_key, use_expert_split=True, override_epochs=None,
         init_weights=True,
         pretrained=use_pretrained,
     ).to(DEVICE)
-    
+
     if use_pretrained:
-        print(f"[INFO] Using pretrained ResNet-50 backbone for {CONFIG['dataset']['name']}")
+        print(
+            f"[INFO] Using pretrained ResNet-50 backbone for {CONFIG['dataset']['name']}"
+        )
 
     criterion = get_loss_function(loss_type, train_loader)
     print(f"[SUCCESS] Loss Function: {type(criterion).__name__}")
@@ -991,7 +1114,7 @@ def train_single_expert(expert_key, use_expert_split=True, override_epochs=None,
     # Use manual LR scheduling for CE expert (paper compliance), otherwise use MultiStepLR or Cosine
     use_manual_lr = expert_config.get("use_manual_lr", False)
     use_cosine = expert_config.get("use_cosine", False)
-    
+
     if use_manual_lr:
         scheduler = None  # Manual LR scheduling, no scheduler object needed
         warmup_epochs = expert_config.get("warmup_epochs", None)
@@ -1001,7 +1124,7 @@ def train_single_expert(expert_key, use_expert_split=True, override_epochs=None,
             warmup_info = f"warmup={warmup_steps} steps to reach base LR"
         else:
             warmup_info = f"warmup={warmup_epochs} epochs"
-        
+
         if use_cosine:
             if len(expert_config.get("milestones", [])) > 0:
                 print(
@@ -1017,15 +1140,11 @@ def train_single_expert(expert_key, use_expert_split=True, override_epochs=None,
                     f"[INFO] Using manual LR scheduling ({warmup_info}, decay 0.1 at epochs {expert_config['milestones']})"
                 )
             else:
-                print(
-                    f"[INFO] Using manual LR scheduling ({warmup_info})"
-                )
+                print(f"[INFO] Using manual LR scheduling ({warmup_info})")
     elif use_cosine:
         warmup_epochs = expert_config.get("warmup_epochs", 0)
         scheduler = optim.lr_scheduler.CosineAnnealingLR(
-            optimizer,
-            T_max=expert_config["epochs"] - warmup_epochs,
-            eta_min=0.0
+            optimizer, T_max=expert_config["epochs"] - warmup_epochs, eta_min=0.0
         )
         print(
             f"[INFO] Using CosineAnnealingLR scheduler (T_max={expert_config['epochs'] - warmup_epochs}, warmup={warmup_epochs})"
@@ -1115,9 +1234,7 @@ def train_single_expert(expert_key, use_expert_split=True, override_epochs=None,
         # Save best model based on validation accuracy
         if val_acc > best_val_acc:
             best_val_acc = val_acc
-            print(
-                f"New best! Val Acc={val_acc:.2f}% → Saving to {best_model_path}"
-            )
+            print(f"New best! Val Acc={val_acc:.2f}% → Saving to {best_model_path}")
             torch.save(model.state_dict(), best_model_path)
 
     # Post-training: Calibration
@@ -1138,7 +1255,9 @@ def train_single_expert(expert_key, use_expert_split=True, override_epochs=None,
     )
     print("📊 Final Results:")
     print(f"   Overall Acc: {final_acc:.2f}% (on balanced val)")
-    print(f"   Head: {final_group_accs['head']:.1f}%, Tail: {final_group_accs['tail']:.1f}%")
+    print(
+        f"   Head: {final_group_accs['head']:.1f}%, Tail: {final_group_accs['tail']:.1f}%"
+    )
 
     # Export logits
     export_logits_for_all_splits(model, expert_name)
