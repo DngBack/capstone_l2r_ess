@@ -1,0 +1,75 @@
+{
+  "sample_info": {
+    "true_label": 69,
+    "class_name": "rocket",
+    "is_tail": true
+  },
+  "paper_baseline": {
+    "prediction": 17,
+    "confidence": 0.8657234311103821,
+    "reject": false,
+    "correct": false,
+    "top5_predictions": [
+      17,
+      76,
+      12,
+      69,
+      5
+    ],
+    "top5_probabilities": [
+      0.8657234311103821,
+      0.06010577827692032,
+      0.03476794809103012,
+      0.011914372444152832,
+      0.007087674457579851
+    ]
+  },
+  "our_method": {
+    "prediction": 76,
+    "confidence": 3.6496500968933105,
+    "reject": false,
+    "correct": false,
+    "expert_predictions": [
+      17,
+      12,
+      71
+    ],
+    "gating_weights": [
+      0.9330843091011047,
+      0.044499319046735764,
+      0.022416478022933006
+    ],
+    "top5_predictions": [
+      17,
+      76,
+      12,
+      69,
+      71
+    ],
+    "top5_probabilities": [
+      0.8135545253753662,
+      0.05985911563038826,
+      0.04612793028354645,
+      0.015829982236027718,
+      0.012442156672477722
+    ],
+    "plugin_params": {
+      "alpha": [
+        1.5179403955859883,
+        0.032802659762977374
+      ],
+      "mu": [
+        0.0,
+        11.25
+      ],
+      "cost": 6.4856462478637695
+    }
+  },
+  "comparison": {
+    "both_correct": false,
+    "baseline_correct_only": false,
+    "our_method_correct_only": false,
+    "confidence_diff": 2.7839266657829285,
+    "rejection_diff": 0
+  }
+}

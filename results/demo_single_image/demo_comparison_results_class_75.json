@@ -1,0 +1,86 @@
+{
+  "sample_info": {
+    "true_label": 75,
+    "class_name": "skunk",
+    "is_tail": true
+  },
+  "paper_method": {
+    "prediction": 75,
+    "confidence": 7.243994235992432,
+    "reject": false,
+    "correct": true,
+    "top5_predictions": [
+      21,
+      19,
+      75,
+      66,
+      40
+    ],
+    "top5_probabilities": [
+      0.5585102438926697,
+      0.258878231048584,
+      0.13899648189544678,
+      0.014434565789997578,
+      0.014021622017025948
+    ],
+    "plugin_params": {
+      "alpha": [
+        1.520794952088476,
+        0.03837564436150131
+      ],
+      "mu": [
+        0.0,
+        20.0
+      ],
+      "cost": 0.3485778570175171
+    }
+  },
+  "our_method": {
+    "prediction": 75,
+    "confidence": 9.41195011138916,
+    "reject": false,
+    "correct": true,
+    "expert_predictions": [
+      21,
+      66,
+      66
+    ],
+    "gating_weights": [
+      0.9059329032897949,
+      0.05752028152346611,
+      0.03654678538441658
+    ],
+    "top5_predictions": [
+      21,
+      19,
+      75,
+      66,
+      40
+    ],
+    "top5_probabilities": [
+      0.5062412023544312,
+      0.2350386381149292,
+      0.15436850488185883,
+      0.059534214437007904,
+      0.014256065711379051
+    ],
+    "plugin_params": {
+      "alpha": [
+        1.5179403955859883,
+        0.032802659762977374
+      ],
+      "mu": [
+        0.0,
+        11.25
+      ],
+      "cost": 6.4856462478637695
+    }
+  },
+  "comparison": {
+    "both_correct": true,
+    "paper_method_correct_only": false,
+    "our_method_correct_only": false,
+    "confidence_diff": 2.1679558753967285,
+    "rejection_diff": 0
+  }
+}
