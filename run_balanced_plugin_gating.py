@@ -128,17 +128,19 @@ DATASET_CONFIGS = {
         "data_dir": "./data/imagenet_lt",
         "train_label_file": "ImageNet_LT_train.txt",
         "val_label_file": "ImageNet_LT_test.txt",
-    }
+    },
 }
 
 
 def setup_config(dataset_name: str) -> Config:
     """Setup Config based on dataset selection."""
     if dataset_name not in DATASET_CONFIGS:
-        raise ValueError(f"Unknown dataset: {dataset_name}. Choose from {list(DATASET_CONFIGS.keys())}")
-    
+        raise ValueError(
+            f"Unknown dataset: {dataset_name}. Choose from {list(DATASET_CONFIGS.keys())}"
+        )
+
     ds_config = DATASET_CONFIGS[dataset_name]
-    
+
     # Create Config with dataset-specific settings
     config = Config(
         dataset_name=dataset_name,
@@ -150,7 +152,7 @@ def setup_config(dataset_name: str) -> Config:
         num_classes=ds_config["num_classes"],
         num_groups=ds_config["num_groups"],
     )
-    
+
     return config
 
 
@@ -201,7 +203,7 @@ def load_labels(split: str, device: str = DEVICE) -> torch.Tensor:
         with open(targets_file, "r", encoding="utf-8") as f:
             targets = json.load(f)
         return torch.tensor(targets, dtype=torch.long, device=device)
-    
+
     # Fallback: reconstruct from CIFAR100 and indices
     import torchvision
 
@@ -249,15 +251,46 @@ def load_class_weights(device: str = DEVICE) -> torch.Tensor:
 def load_gating_network(device: str = DEVICE):  # Returns GatingNetwork
     """Load trained gating network."""
     from src.models.gating_network_map import GatingNetwork, GatingMLP
-    from src.models.gating import GatingFeatureBuilder
 
     num_experts = len(CFG.expert_names)
     num_classes = CFG.num_classes
 
     print(f"Loading gating network for {num_experts} experts: {CFG.expert_names}")
 
+    checkpoint_path = Path(CFG.gating_checkpoint)
+    if not checkpoint_path.exists():
+        raise FileNotFoundError(f"Missing gating checkpoint: {checkpoint_path}")
+
+    checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
+
+    # Extract routing config from checkpoint (if available)
+    routing = "dense"  # default
+    top_k = 2  # default
+    noise_std = 1.0  # default
+    hidden_dims = [256, 128]  # default
+    dropout = 0.1  # default
+    activation = "relu"  # default
+
+    if "config" in checkpoint:
+        gating_config = checkpoint["config"].get("gating", {})
+        routing = gating_config.get("routing", "dense")
+        top_k = gating_config.get("top_k", 2)
+        noise_std = gating_config.get("noise_std", 1.0)
+        hidden_dims = gating_config.get("hidden_dims", [256, 128])
+        dropout = gating_config.get("dropout", 0.1)
+        activation = gating_config.get("activation", "relu")
+        print(f"  Found checkpoint config: routing={routing}, top_k={top_k}")
+
+    # Create gating network with correct routing type
     gating = GatingNetwork(
-        num_experts=num_experts, num_classes=num_classes, routing="dense"
+        num_experts=num_experts,
+        num_classes=num_classes,
+        routing=routing,
+        top_k=top_k,
+        noise_std=noise_std,
+        hidden_dims=hidden_dims,
+        dropout=dropout,
+        activation=activation,
     ).to(device)
 
     # Match compact feature setup used during training (GatingFeatureBuilder: D = 7*E + 3)
@@ -265,16 +298,10 @@ def load_gating_network(device: str = DEVICE):  # Returns GatingNetwork
     gating.mlp = GatingMLP(
         input_dim=compact_dim,
         num_experts=num_experts,
-        hidden_dims=[256, 128],
-        dropout=0.1,
-        activation='relu',
+        hidden_dims=hidden_dims,
+        dropout=dropout,
+        activation=activation,
     ).to(device)
-
-    checkpoint_path = Path(CFG.gating_checkpoint)
-    if not checkpoint_path.exists():
-        raise FileNotFoundError(f"Missing gating checkpoint: {checkpoint_path}")
-
-    checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
 
     # Verify checkpoint matches expected number of experts
     if "model_state_dict" in checkpoint:
@@ -295,6 +322,7 @@ def load_gating_network(device: str = DEVICE):  # Returns GatingNetwork
 
     print(f"✓ Loaded gating network from: {checkpoint_path}")
     print(f"✓ Gating network configured for {num_experts} experts: {CFG.expert_names}")
+    print(f"✓ Routing type: {routing}, Top-K: {top_k if routing == 'top_k' else 'N/A'}")
     return gating
 
 
@@ -309,8 +337,9 @@ def compute_mixture_posterior(
         # Convert logits to posteriors (for mixture) and build compact gating features
         expert_posteriors = F.softmax(expert_logits, dim=-1)  # [N, E, C]
         from src.models.gating import GatingFeatureBuilder
+
         feat_builder = GatingFeatureBuilder()
-        features = feat_builder(expert_logits)                # [N, 7*E+3]
+        features = feat_builder(expert_logits)  # [N, 7*E+3]
 
         # Verify shape matches expected number of experts
         num_experts_logits = expert_logits.shape[1]
@@ -321,8 +350,22 @@ def compute_mixture_posterior(
             )
 
         # Get gating weights via mlp + router on compact features
-        gating_logits = gating_net.mlp(features)              # [N, E]
-        gating_weights = gating_net.router(gating_logits)     # [N, E]
+        gating_logits = gating_net.mlp(features)  # [N, E]
+        gating_weights = gating_net.router(gating_logits)  # [N, E]
+
+        # Debug: Show top-k selection if using top-k routing
+        if hasattr(gating_net, "routing_type") and gating_net.routing_type == "top_k":
+            # Count how many samples use each expert (non-zero weights)
+            active_experts = (gating_weights > 1e-6).sum(dim=0)  # [E]
+            num_active_per_sample = (gating_weights > 1e-6).sum(dim=1)  # [N]
+            if gating_weights.shape[0] > 0:  # Only print if we have samples
+                print(
+                    f"  Top-K routing: {num_active_per_sample.float().mean().item():.2f} experts per sample "
+                    f"(expected: {gating_net.router.top_k if hasattr(gating_net.router, 'top_k') else 'N/A'})"
+                )
+                print(
+                    f"  Expert usage: {[f'{i}:{count.item()}' for i, count in enumerate(active_experts)]}"
+                )
 
         # Check for NaN
         if torch.isnan(gating_weights).any():
@@ -724,10 +767,12 @@ def main():
     print("Loading S1 (tunev) and S2 (val) for selection/evaluation...")
     expert_logits_tunev = load_expert_logits(CFG.expert_names, "tunev", DEVICE)
     labels_tunev = load_labels("tunev", DEVICE)
-    
+
     # Validate sizes match for tunev
     if expert_logits_tunev.shape[0] != labels_tunev.shape[0]:
-        print(f"⚠️  WARNING: Size mismatch for tunev! Logits: {expert_logits_tunev.shape[0]}, Labels: {labels_tunev.shape[0]}")
+        print(
+            f"⚠️  WARNING: Size mismatch for tunev! Logits: {expert_logits_tunev.shape[0]}, Labels: {labels_tunev.shape[0]}"
+        )
         min_size = min(expert_logits_tunev.shape[0], labels_tunev.shape[0])
         print(f"    Truncating to {min_size} samples")
         expert_logits_tunev = expert_logits_tunev[:min_size]
@@ -735,10 +780,12 @@ def main():
 
     expert_logits_val = load_expert_logits(CFG.expert_names, "val", DEVICE)
     labels_val = load_labels("val", DEVICE)
-    
+
     # Validate sizes match for val
     if expert_logits_val.shape[0] != labels_val.shape[0]:
-        print(f"⚠️  WARNING: Size mismatch for val! Logits: {expert_logits_val.shape[0]}, Labels: {labels_val.shape[0]}")
+        print(
+            f"⚠️  WARNING: Size mismatch for val! Logits: {expert_logits_val.shape[0]}, Labels: {labels_val.shape[0]}"
+        )
         min_size = min(expert_logits_val.shape[0], labels_val.shape[0])
         print(f"    Truncating to {min_size} samples")
         expert_logits_val = expert_logits_val[:min_size]
@@ -757,15 +804,17 @@ def main():
     # Check baseline balanced error on test set
     expert_logits_test = load_expert_logits(CFG.expert_names, "test", DEVICE)
     labels_test = load_labels("test", DEVICE)
-    
+
     # Validate sizes match
     if expert_logits_test.shape[0] != labels_test.shape[0]:
-        print(f"⚠️  WARNING: Size mismatch! Logits: {expert_logits_test.shape[0]}, Labels: {labels_test.shape[0]}")
+        print(
+            f"⚠️  WARNING: Size mismatch! Logits: {expert_logits_test.shape[0]}, Labels: {labels_test.shape[0]}"
+        )
         min_size = min(expert_logits_test.shape[0], labels_test.shape[0])
         print(f"    Truncating to {min_size} samples")
         expert_logits_test = expert_logits_test[:min_size]
         labels_test = labels_test[:min_size]
-    
+
     posterior_test = compute_mixture_posterior(expert_logits_test, gating, DEVICE)
 
     # Compute baseline balanced error (no rejection) with importance weighting
@@ -1147,32 +1196,48 @@ def main():
     with open(out_json, "w", encoding="utf-8") as f:
         json.dump(save_dict, f, indent=2)
     print(f"Saved results to: {out_json}")
-    
+
     # Export CSV for easy tracking
     csv_data = []
     for r in results_per_cost:
-        csv_data.append({
-            'target_rejection': r['target_rejection'],
-            'val_balanced_error': r['val_metrics']['balanced_error'],
-            'val_worst_group_error': r['val_metrics']['worst_group_error'],
-            'val_coverage': r['val_metrics']['coverage'],
-            'val_head_error': r['val_metrics']['group_errors'][0] if len(r['val_metrics']['group_errors']) >= 2 else None,
-            'val_tail_error': r['val_metrics']['group_errors'][1] if len(r['val_metrics']['group_errors']) >= 2 else None,
-            'val_tail_minus_head': r['val_metrics']['group_errors'][1] - r['val_metrics']['group_errors'][0] if len(r['val_metrics']['group_errors']) >= 2 else None,
-            'test_balanced_error': r['test_metrics']['balanced_error'],
-            'test_worst_group_error': r['test_metrics']['worst_group_error'],
-            'test_coverage': r['test_metrics']['coverage'],
-            'test_head_error': r['test_metrics']['group_errors'][0] if len(r['test_metrics']['group_errors']) >= 2 else None,
-            'test_tail_error': r['test_metrics']['group_errors'][1] if len(r['test_metrics']['group_errors']) >= 2 else None,
-            'test_tail_minus_head': r['test_metrics']['group_errors'][1] - r['test_metrics']['group_errors'][0] if len(r['test_metrics']['group_errors']) >= 2 else None,
-            'alpha_head': r['alpha'][0] if len(r['alpha']) >= 2 else None,
-            'alpha_tail': r['alpha'][1] if len(r['alpha']) >= 2 else None,
-            'mu_head': r['mu'][0] if len(r['mu']) >= 2 else None,
-            'mu_tail': r['mu'][1] if len(r['mu']) >= 2 else None,
-            'cost_val': r['cost_val'],
-            'cost_test': r['cost_test'],
-        })
-    
+        csv_data.append(
+            {
+                "target_rejection": r["target_rejection"],
+                "val_balanced_error": r["val_metrics"]["balanced_error"],
+                "val_worst_group_error": r["val_metrics"]["worst_group_error"],
+                "val_coverage": r["val_metrics"]["coverage"],
+                "val_head_error": r["val_metrics"]["group_errors"][0]
+                if len(r["val_metrics"]["group_errors"]) >= 2
+                else None,
+                "val_tail_error": r["val_metrics"]["group_errors"][1]
+                if len(r["val_metrics"]["group_errors"]) >= 2
+                else None,
+                "val_tail_minus_head": r["val_metrics"]["group_errors"][1]
+                - r["val_metrics"]["group_errors"][0]
+                if len(r["val_metrics"]["group_errors"]) >= 2
+                else None,
+                "test_balanced_error": r["test_metrics"]["balanced_error"],
+                "test_worst_group_error": r["test_metrics"]["worst_group_error"],
+                "test_coverage": r["test_metrics"]["coverage"],
+                "test_head_error": r["test_metrics"]["group_errors"][0]
+                if len(r["test_metrics"]["group_errors"]) >= 2
+                else None,
+                "test_tail_error": r["test_metrics"]["group_errors"][1]
+                if len(r["test_metrics"]["group_errors"]) >= 2
+                else None,
+                "test_tail_minus_head": r["test_metrics"]["group_errors"][1]
+                - r["test_metrics"]["group_errors"][0]
+                if len(r["test_metrics"]["group_errors"]) >= 2
+                else None,
+                "alpha_head": r["alpha"][0] if len(r["alpha"]) >= 2 else None,
+                "alpha_tail": r["alpha"][1] if len(r["alpha"]) >= 2 else None,
+                "mu_head": r["mu"][0] if len(r["mu"]) >= 2 else None,
+                "mu_tail": r["mu"][1] if len(r["mu"]) >= 2 else None,
+                "cost_val": r["cost_val"],
+                "cost_test": r["cost_test"],
+            }
+        )
+
     df = pd.DataFrame(csv_data)
     csv_path = Path(CFG.results_dir) / "ltr_plugin_gating_balanced.csv"
     df.to_csv(csv_path, index=False)
@@ -1219,60 +1284,60 @@ def main():
 if __name__ == "__main__":
     import sys
     from datetime import datetime
-    
+
     parser = argparse.ArgumentParser(description="Balanced L2R Plugin with Gating")
     parser.add_argument(
         "--dataset",
         type=str,
         default="cifar100_lt_if100",
         choices=["cifar100_lt_if100", "inaturalist2018", "imagenet_lt"],
-        help="Dataset name"
+        help="Dataset name",
     )
     parser.add_argument(
         "--log-file",
         type=str,
         default=None,
-        help="Path to log file. If provided, all output will be saved to this file"
+        help="Path to log file. If provided, all output will be saved to this file",
     )
     args = parser.parse_args()
-    
+
     # Setup logging if log_file is provided
     original_stdout = sys.stdout
     log_file_handle = None
-    
+
     if args.log_file:
         log_path = Path(args.log_file)
         log_path.parent.mkdir(parents=True, exist_ok=True)
-        log_file_handle = open(log_path, 'w', encoding='utf-8')
-        
+        log_file_handle = open(log_path, "w", encoding="utf-8")
+
         # Create a class that writes to both stdout and log file
         class TeeOutput:
             def __init__(self, *files):
                 self.files = files
-            
+
             def write(self, obj):
                 for f in self.files:
                     f.write(obj)
                     f.flush()
-            
+
             def flush(self):
                 for f in self.files:
                     f.flush()
-        
+
         sys.stdout = TeeOutput(original_stdout, log_file_handle)
-        print(f"\n{'='*80}")
+        print(f"\n{'=' * 80}")
         print(f"LOGGING TO FILE: {log_path}")
         print(f"STARTED AT: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-        print(f"{'='*80}\n")
-    
+        print(f"{'=' * 80}\n")
+
     try:
         # Setup config based on dataset
         CFG = setup_config(args.dataset)
-        
+
         print(f"✓ Using dataset: {args.dataset}")
         print(f"  Classes: {CFG.num_classes}")
         print(f"  Experts: {CFG.expert_names}")
-        
+
         main()
     finally:
         # Restore stdout and close log file

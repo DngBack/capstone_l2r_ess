@@ -198,25 +198,56 @@ def load_class_weights(device: str = DEVICE) -> torch.Tensor:
 
 def load_gating_network(device: str = DEVICE):
     from src.models.gating_network_map import GatingNetwork, GatingMLP
-    from src.models.gating import GatingFeatureBuilder
 
     num_experts = len(CFG.expert_names)
+    num_classes = CFG.num_classes
+
+    checkpoint_path = Path(CFG.gating_checkpoint)
+    if not checkpoint_path.exists():
+        raise FileNotFoundError(f"Missing gating checkpoint: {checkpoint_path}")
+
+    checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
+
+    # Extract routing config from checkpoint (if available)
+    routing = "dense"  # default
+    top_k = 2  # default
+    noise_std = 1.0  # default
+    hidden_dims = [256, 128]  # default
+    dropout = 0.1  # default
+    activation = "relu"  # default
+
+    if "config" in checkpoint:
+        gating_config = checkpoint["config"].get("gating", {})
+        routing = gating_config.get("routing", "dense")
+        top_k = gating_config.get("top_k", 2)
+        noise_std = gating_config.get("noise_std", 1.0)
+        hidden_dims = gating_config.get("hidden_dims", [256, 128])
+        dropout = gating_config.get("dropout", 0.1)
+        activation = gating_config.get("activation", "relu")
+        print(f"  Found checkpoint config: routing={routing}, top_k={top_k}")
+
+    # Create gating network with correct routing type
     gating = GatingNetwork(
-        num_experts=num_experts, num_classes=CFG.num_classes, routing="dense"
+        num_experts=num_experts,
+        num_classes=num_classes,
+        routing=routing,
+        top_k=top_k,
+        noise_std=noise_std,
+        hidden_dims=hidden_dims,
+        dropout=dropout,
+        activation=activation,
     ).to(device)
+
     # Rebuild MLP to match compact feature dimension from training (7*E + 3)
     compact_dim = 7 * num_experts + 3
     gating.mlp = GatingMLP(
         input_dim=compact_dim,
         num_experts=num_experts,
-        hidden_dims=[256, 128],
-        dropout=0.1,
-        activation="relu",
+        hidden_dims=hidden_dims,
+        dropout=dropout,
+        activation=activation,
     ).to(device)
-    checkpoint_path = Path(CFG.gating_checkpoint)
-    if not checkpoint_path.exists():
-        raise FileNotFoundError(f"Missing gating checkpoint: {checkpoint_path}")
-    checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
+
     if "model_state_dict" in checkpoint:
         state_dict = checkpoint["model_state_dict"]
         if "mlp.mlp.8.weight" in state_dict:
@@ -228,6 +259,7 @@ def load_gating_network(device: str = DEVICE):
                 )
     gating.load_state_dict(checkpoint["model_state_dict"])
     gating.eval()
+    print(f"✓ Loaded gating network: routing={routing}, top_k={top_k if routing == 'top_k' else 'N/A'}")
     return gating
 
 
@@ -250,6 +282,17 @@ def compute_mixture_posterior(
     features = feat_builder(expert_logits)  # [N, 7*E+3]
     gating_logits = gating_net.mlp(features)
     gating_weights = gating_net.router(gating_logits)
+    
+    # Debug: Show top-k selection if using top-k routing
+    if hasattr(gating_net, 'routing_type') and gating_net.routing_type == 'top_k':
+        active_experts = (gating_weights > 1e-6).sum(dim=0)  # [E]
+        num_active_per_sample = (gating_weights > 1e-6).sum(dim=1)  # [N]
+        if gating_weights.shape[0] > 0:
+            print(
+                f"  Top-K routing: {num_active_per_sample.float().mean().item():.2f} experts per sample "
+                f"(expected: {gating_net.router.top_k if hasattr(gating_net.router, 'top_k') else 'N/A'})"
+            )
+    
     if torch.isnan(gating_weights).any():
         N, E = expert_logits.shape[0], expert_logits.shape[1]
         gating_weights = torch.ones(N, E, device=device) / E
