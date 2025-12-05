@@ -1,0 +1,86 @@
+{
+  "sample_info": {
+    "true_label": 95,
+    "class_name": "whale",
+    "is_tail": true
+  },
+  "paper_method": {
+    "prediction": 30,
+    "confidence": 1.2821351289749146,
+    "reject": true,
+    "correct": false,
+    "top5_predictions": [
+      30,
+      95,
+      73,
+      93,
+      55
+    ],
+    "top5_probabilities": [
+      0.9749323129653931,
+      0.01773705706000328,
+      0.0027697253972291946,
+      0.001560882548801601,
+      0.0013049014378339052
+    ],
+    "plugin_params": {
+      "alpha": [
+        1.520794952088476,
+        0.03837564436150131
+      ],
+      "mu": [
+        0.0,
+        20.0
+      ],
+      "cost": 0.3485778570175171
+    }
+  },
+  "our_method": {
+    "prediction": 95,
+    "confidence": 1.5675270557403564,
+    "reject": false,
+    "correct": true,
+    "expert_predictions": [
+      30,
+      30,
+      30
+    ],
+    "gating_weights": [
+      0.1994764357805252,
+      0.21027244627475739,
+      0.590251088142395
+    ],
+    "top5_predictions": [
+      30,
+      95,
+      55,
+      72,
+      93
+    ],
+    "top5_probabilities": [
+      0.9613662958145142,
+      0.025709528475999832,
+      0.0071668364107608795,
+      0.0030435589142143726,
+      0.001452503609471023
+    ],
+    "plugin_params": {
+      "alpha": [
+        1.5179403955859883,
+        0.032802659762977374
+      ],
+      "mu": [
+        0.0,
+        11.25
+      ],
+      "cost": 6.4856462478637695
+    }
+  },
+  "comparison": {
+    "both_correct": false,
+    "paper_method_correct_only": false,
+    "our_method_correct_only": true,
+    "confidence_diff": 0.2853919267654419,
+    "rejection_diff": -1
+  }
+}

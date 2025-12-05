@@ -481,6 +481,67 @@ class GatingNetwork(nn.Module):
         )
         
         return mixture_posterior
+    
+    def compute_weights_from_logits(
+        self, 
+        expert_logits: torch.Tensor,
+        feature_builder = None
+    ) -> Tuple[torch.Tensor, Dict]:
+        """
+        Compute gating weights from expert logits using lightweight features.
+        This matches the training/inference pipeline.
+        
+        Args:
+            expert_logits: [B, E, C]
+            feature_builder: Optional GatingFeatureBuilder (will create if None)
+        
+        Returns:
+            weights: [B, E]
+            aux_outputs: dict với logits và features
+        """
+        if feature_builder is None:
+            from src.models.gating import GatingFeatureBuilder
+            feature_builder = GatingFeatureBuilder()
+        
+        # Extract lightweight features (matches training pipeline)
+        features = feature_builder(expert_logits)  # [B, 7*E+3]
+        
+        # MLP + Router
+        gating_logits = self.mlp(features)  # [B, E]
+        weights = self.router(gating_logits)  # [B, E]
+        
+        aux_outputs = {
+            'logits': gating_logits,
+            'features': features,
+        }
+        
+        return weights, aux_outputs
+    
+    def get_mixture_posterior_from_logits(
+        self,
+        expert_logits: torch.Tensor,
+        feature_builder = None
+    ) -> torch.Tensor:
+        """
+        Compute mixture posterior from expert logits.
+        This is the main method to use in inference.
+        
+        Args:
+            expert_logits: [B, E, C]
+            feature_builder: Optional GatingFeatureBuilder
+        
+        Returns:
+            mixture_posterior: [B, C]
+        """
+        expert_posteriors = F.softmax(expert_logits, dim=-1)  # [B, E, C]
+        weights, _ = self.compute_weights_from_logits(expert_logits, feature_builder)
+        
+        mixture_posterior = torch.sum(
+            weights.unsqueeze(-1) * expert_posteriors,
+            dim=1
+        )  # [B, C]
+        
+        return mixture_posterior
 
 
 # ============================================================================
