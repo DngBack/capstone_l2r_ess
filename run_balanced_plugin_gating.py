@@ -414,9 +414,9 @@ def build_class_to_group() -> torch.Tensor:
     tail_mask = counts <= CFG.tail_threshold
     class_to_group = np.zeros(CFG.num_classes, dtype=np.int64)
     class_to_group[tail_mask] = 1  # 0=head, 1=tail
-    print(
-        f"Groups: head={(class_to_group == 0).sum()}, tail={(class_to_group == 1).sum()}"
-    )
+    # print(
+    #     f"Groups: head={(class_to_group == 0).sum()}, tail={(class_to_group == 1).sum()}"
+    # )
     return torch.tensor(class_to_group, dtype=torch.long, device=DEVICE)
 
 

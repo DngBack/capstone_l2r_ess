@@ -86,7 +86,6 @@ def create_notebook():
             "    load_all_experts,\n",
             "    load_gating_network,\n",
             "    load_plugin_params,\n",
-            "    load_ce_only_plugin_params,\n",
             "    paper_method_pipeline,\n",
             "    our_method_pipeline,\n",
             "    visualize_comparison,\n",
@@ -179,8 +178,8 @@ def create_notebook():
             "gating = load_gating_network()\n",
             "\n",
             "# Load plugin parameters for both methods\n",
-            "ce_plugin_alpha, ce_plugin_mu, ce_plugin_cost = load_ce_only_plugin_params()\n",
-            "moe_plugin_alpha, moe_plugin_mu, moe_plugin_cost = load_plugin_params()"
+            "ce_plugin_alpha, ce_plugin_mu, ce_plugin_cost = load_plugin_params(method=\"ce_only\", mode=\"balanced\")\n",
+            "moe_plugin_alpha, moe_plugin_mu, moe_plugin_cost = load_plugin_params(method=\"moe\", mode=\"worst\")"
         ]
     })
     

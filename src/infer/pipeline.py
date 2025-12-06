@@ -38,7 +38,6 @@ from .loaders import (
     load_all_experts,
     load_gating_network,
     load_plugin_params,
-    load_ce_only_plugin_params,
     DATASET,
     NUM_CLASSES,
     NUM_GROUPS,
@@ -69,7 +68,6 @@ __all__ = [
     'load_all_experts',
     'load_gating_network',
     'load_plugin_params',
-    'load_ce_only_plugin_params',
     'DATASET',
     'NUM_CLASSES',
     'NUM_GROUPS',
@@ -390,7 +388,7 @@ def compute_rejection_thresholds_from_test_set(
     return thresholds
 
 
-def τplot_full_class_distribution(
+def plot_full_class_distribution(
     true_label: int,
     paper_result: Dict,
     our_result: Dict,

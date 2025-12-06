@@ -42,8 +42,9 @@ __all__ = [
     'SPLITS_DIR', 'CHECKPOINTS_DIR', 'RESULTS_DIR',
     'EXPERT_NAMES', 'EXPERT_DISPLAY_NAMES',
     'load_class_to_group', 'load_test_sample_with_image',
+    'load_image_from_infer_samples',
     'load_ce_expert', 'load_all_experts', 'load_gating_network',
-    'load_plugin_params', 'load_ce_only_plugin_params',
+    'load_plugin_params',
 ]
 
 
@@ -67,12 +68,115 @@ def load_class_to_group() -> torch.Tensor:
     # Update print message to match expected format
     num_head = (result.cpu().numpy() == 0).sum()
     num_tail = (result.cpu().numpy() == 1).sum()
-    print(f"📊 Groups: {num_head} head classes, {num_tail} tail classes")
+    # print(f"📊 Groups: {num_head} head classes, {num_tail} tail classes")
     return result
 
 
+def load_image_from_infer_samples(
+    image_path: Optional[Path] = None,
+    class_idx: Optional[int] = None,
+    group: Optional[str] = None
+) -> Tuple[torch.Tensor, int, np.ndarray, str]:
+    """
+    Load image from infer_samples folder.
+    
+    Args:
+        image_path: Direct path to image file (e.g., Path("./infer_samples/Cifar100/tail/tail_70_rose.png"))
+        class_idx: Class index to load (will search in Cifar100/head or Cifar100/tail)
+        group: "head" or "tail" (required if class_idx is provided)
+    
+    Returns:
+        Tuple of (image_tensor, label, image_array, class_name)
+    """
+    from PIL import Image
+    
+    infer_samples_dir = Path("./infer_samples")
+    
+    # Case 1: Direct image path provided
+    if image_path is not None:
+        if isinstance(image_path, str):
+            image_path = Path(image_path)
+        
+        if not image_path.exists():
+            raise FileNotFoundError(f"Image not found: {image_path}")
+        
+        # Load image
+        image = Image.open(image_path).convert('RGB')
+        image_array = np.array(image)  # [H, W, 3]
+        
+        # Parse filename to extract class info
+        # Format: {group}_{class_idx}_{class_name}.png
+        filename = image_path.stem
+        parts = filename.split('_')
+        
+        if len(parts) >= 3:
+            group_name = parts[0]
+            class_idx_parsed = int(parts[1])
+            class_name = '_'.join(parts[2:])  # Handle class names with underscores
+        else:
+            # Fallback: try to extract from path
+            if 'head' in str(image_path):
+                group_name = "head"
+            elif 'tail' in str(image_path):
+                group_name = "tail"
+            else:
+                group_name = "unknown"
+            
+            # Try to extract class_idx from filename
+            class_idx_parsed = None
+            for part in parts:
+                if part.isdigit():
+                    class_idx_parsed = int(part)
+                    break
+            
+            class_name = image_path.stem
+        
+        label = class_idx_parsed if class_idx_parsed is not None else -1
+        
+    # Case 2: Search by class_idx and group
+    elif class_idx is not None and group is not None:
+        cifar100_dir = infer_samples_dir / "Cifar100" / group
+        if not cifar100_dir.exists():
+            raise FileNotFoundError(f"Directory not found: {cifar100_dir}")
+        
+        # Search for file matching pattern: {group}_{class_idx}_*.png
+        pattern = f"{group}_{class_idx}_*.png"
+        matching_files = list(cifar100_dir.glob(pattern))
+        
+        if len(matching_files) == 0:
+            raise FileNotFoundError(f"No image found for class {class_idx} in {group} group")
+        
+        image_path = matching_files[0]
+        image = Image.open(image_path).convert('RGB')
+        image_array = np.array(image)
+        
+        # Parse class name from filename
+        filename = image_path.stem
+        parts = filename.split('_')
+        class_name = '_'.join(parts[2:]) if len(parts) >= 3 else filename
+        label = class_idx
+    
+    else:
+        raise ValueError("Must provide either image_path or (class_idx, group)")
+    
+    # Resize to 32x32 if needed (for CIFAR-100 compatibility)
+    if image_array.shape[:2] != (32, 32):
+        image = Image.fromarray(image_array).resize((32, 32), Image.Resampling.LANCZOS)
+        image_array = np.array(image)
+    
+    # Apply transforms for model input
+    transform = get_eval_augmentations()
+    image_tensor = transform(image).unsqueeze(0).to(DEVICE)  # [1, 3, 32, 32]
+    
+    print(f"\n📷 Loaded image from: {image_path}")
+    print(f"   Class: {label} ({class_name})")
+    print(f"   Image shape: {image_array.shape}")
+    
+    return image_tensor, label, image_array, class_name
+
+
 def load_test_sample_with_image(class_idx: Optional[int] = None) -> Tuple[torch.Tensor, int, np.ndarray, str]:
-    """Load a single test sample."""
+    """Load a single test sample from CIFAR-100 dataset."""
     dataset = torchvision.datasets.CIFAR100(root="./data", train=False, download=False)
     
     indices_file = SPLITS_DIR / "test_indices.json"
@@ -215,89 +319,84 @@ def load_gating_network():
     return result
 
 
-def load_plugin_params() -> Tuple[np.ndarray, np.ndarray, float]:
+def load_plugin_params(method: str = "moe", mode: str = "worst") -> Tuple[np.ndarray, np.ndarray, float]:
     """
-    Load optimized plugin parameters for MoE from WORST mode results JSON.
-    Selects config with rejection rate closest to 0.3.
+    Load optimized plugin parameters from results JSON files.
+    
+    Args:
+        method: Either "moe" (Mixture of Experts with gating) or "ce_only" (CE expert only)
+        mode: Either "balanced" or "worst"
+    
+    Returns:
+        Tuple of (alpha, mu, cost) as numpy arrays and float
+    
+    Raises:
+        FileNotFoundError: If the results file does not exist
+        ValueError: If the results file is empty or invalid
     """
-    results_path = RESULTS_DIR / "ltr_plugin_gating_worst.json"
+    # Determine file path based on method and mode
+    if method == "moe":
+        if mode == "worst":
+            results_path = RESULTS_DIR / "ltr_plugin_gating_worst.json"
+            results_key = "results_per_point"
+            metrics_key = "test_metrics"
+        elif mode == "balanced":
+            results_path = RESULTS_DIR / "ltr_plugin_gating_balanced.json"
+            results_key = "results_per_cost"
+            metrics_key = "val_metrics"
+        else:
+            raise ValueError(f"Invalid mode '{mode}' for method 'moe'. Must be 'balanced' or 'worst'")
+    elif method == "ce_only":
+        if mode == "balanced":
+            results_path = RESULTS_DIR / "ltr_plugin_ce_only_balanced.json"
+            results_key = "results_per_cost"
+            metrics_key = "val_metrics"
+        elif mode == "worst":
+            results_path = RESULTS_DIR / "ltr_plugin_ce_only_worst.json"
+            results_key = "results_per_point"
+            metrics_key = "test_metrics"
+        else:
+            raise ValueError(f"Invalid mode '{mode}' for method 'ce_only'. Must be 'balanced' or 'worst'")
+    else:
+        raise ValueError(f"Invalid method '{method}'. Must be 'moe' or 'ce_only'")
     
     if not results_path.exists():
-        print(f"⚠️  Plugin results not found at {results_path}")
-        print("   Using default parameters...")
-        return np.array([1.0, 1.0]), np.array([0.0, 0.0]), 0.0
+        raise FileNotFoundError(f"Plugin results not found at {results_path}")
     
     with open(results_path, "r", encoding="utf-8") as f:
         results = json.load(f)
     
-    results_per_point = results.get("results_per_point", [])
+    results_list = results.get(results_key, [])
     
-    if len(results_per_point) == 0:
-        print("⚠️  No results found, using defaults")
-        return np.array([1.0, 1.0]), np.array([0.0, 0.0]), 0.0
+    if len(results_list) == 0:
+        raise ValueError(f"No results found in {results_path} under key '{results_key}'")
     
     # Find config with rejection rate closest to 0.3
     best_result = None
     best_diff = float('inf')
     
-    for r in results_per_point:
-        rej_rate = 1.0 - r["test_metrics"]["coverage"]
+    for r in results_list:
+        rej_rate = 1.0 - r[metrics_key]["coverage"]
         diff = abs(rej_rate - 0.3)
         if diff < best_diff:
             best_diff = diff
             best_result = r
     
     if best_result is None:
-        best_result = results_per_point[0]
+        best_result = results_list[0]
     
     alpha = np.array(best_result["alpha"])
     mu = np.array(best_result["mu"])
-    # cost_test is the relevant cost on test set; keep same key name
-    cost = best_result.get("cost_test", 0.0)
     
-    print(f"✅ Loaded plugin params (worst mode fallback) from {results_path}")
-    print(f"   α = {alpha}, μ = {mu}, cost = {cost:.4f}")
+    # Extract cost based on method and mode
+    if method == "moe" and mode == "worst":
+        cost = best_result.get("cost_test", 0.0)
+    elif method == "ce_only" and mode == "balanced":
+        cost = best_result.get("cost_val", best_result.get("cost_test", 0.0))
+    else:
+        cost = best_result.get("cost_test", best_result.get("cost_val", 0.0))
     
-    return alpha, mu, cost
-
-
-def load_ce_only_plugin_params() -> Tuple[np.ndarray, np.ndarray, float]:
-    """Load optimized plugin parameters for CE-only from balanced mode results JSON."""
-    results_path = RESULTS_DIR / "ltr_plugin_ce_only_balanced.json"
-    
-    if not results_path.exists():
-        print(f"⚠️  CE-only plugin results not found at {results_path}")
-        print("   Using default parameters...")
-        return np.array([1.0, 1.0]), np.array([0.0, 0.0]), 0.0
-    
-    with open(results_path, "r", encoding="utf-8") as f:
-        results = json.load(f)
-    
-    results_per_cost = results.get("results_per_cost", [])
-    
-    if len(results_per_cost) == 0:
-        print("⚠️  No results found, using defaults")
-        return np.array([1.0, 1.0]), np.array([0.0, 0.0]), 0.0
-    
-    # Find config with rejection rate closest to 0.3
-    best_result = None
-    best_diff = float('inf')
-    
-    for r in results_per_cost:
-        rej_rate = 1.0 - r["val_metrics"]["coverage"]
-        diff = abs(rej_rate - 0.3)
-        if diff < best_diff:
-            best_diff = diff
-            best_result = r
-    
-    if best_result is None:
-        best_result = results_per_cost[0]
-    
-    alpha = np.array(best_result["alpha"])
-    mu = np.array(best_result["mu"])
-    cost = best_result.get("cost_val", best_result.get("cost_test", 0.0))
-    
-    print(f"✅ Loaded CE-only plugin params (worst mode) from {results_path}")
-    print(f"   α = {alpha}, μ = {mu}, cost = {cost:.4f}")
+    print(f"✅ Loaded plugin params ({method}, {mode}) from {results_path}")
+    print(f"   α = {alpha}, μ = {mu}")
     
     return alpha, mu, cost
