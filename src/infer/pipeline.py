@@ -79,6 +79,82 @@ __all__ = [
 
 
 # ============================================================================
+# HELPER FUNCTIONS
+# ============================================================================
+
+def _compute_reweighted_scores(
+    posterior: np.ndarray,
+    plugin_params: Dict,
+    class_to_group: torch.Tensor,
+    plugin_beta: Optional[np.ndarray] = None
+) -> np.ndarray:
+    """
+    Compute reweighted scores for each class: (1/α̂[y]) * p_y for balanced mode, or (u[y]) * p_y for worst mode.
+    
+    Returns:
+        reweighted_scores: [100] array of reweighted scores per class
+    """
+    alpha = np.array(plugin_params['alpha'])
+    mu = np.array(plugin_params['mu'])
+    cost = float(plugin_params['cost'])
+    
+    posterior_tensor = torch.tensor(posterior, dtype=torch.float32, device=class_to_group.device).unsqueeze(0)
+    eps = 1e-12
+    
+    if plugin_beta is not None:
+        # Worst mode (GeneralizedLtRPlugin)
+        plugin = GeneralizedLtRPlugin(class_to_group, alpha, mu, plugin_beta, cost)
+        u = plugin._u_class().unsqueeze(0)  # [1, 100]
+        reweighted = (posterior_tensor * u).squeeze(0)  # [100]
+    else:
+        # Balanced mode (BalancedLtRPlugin)
+        plugin = BalancedLtRPlugin(class_to_group, alpha, mu, cost)
+        alpha_hat = plugin._alpha_hat_class().clamp(min=eps)  # [100]
+        inv_alpha_hat = 1.0 / alpha_hat  # [100]
+        reweighted = (posterior_tensor * inv_alpha_hat.unsqueeze(0)).squeeze(0)  # [100]
+    
+    return reweighted.cpu().numpy()
+
+
+def _compute_plugin_threshold_and_max_reweighted(
+    posterior: np.ndarray,
+    plugin_params: Dict,
+    class_to_group: torch.Tensor,
+    plugin_beta: Optional[np.ndarray] = None
+) -> Tuple[float, float]:
+    """
+    Compute plugin max_reweighted and threshold for a given posterior.
+    
+    Returns:
+        (max_reweighted, threshold) tuple
+    """
+    alpha = np.array(plugin_params['alpha'])
+    mu = np.array(plugin_params['mu'])
+    cost = float(plugin_params['cost'])
+    
+    posterior_tensor = torch.tensor(posterior, dtype=torch.float32, device=class_to_group.device).unsqueeze(0)
+    eps = 1e-12
+    
+    if plugin_beta is not None:
+        # Worst mode (GeneralizedLtRPlugin)
+        plugin = GeneralizedLtRPlugin(class_to_group, alpha, mu, plugin_beta, cost)
+        u = plugin._u_class().unsqueeze(0)
+        mu_tensor = plugin._mu_class().unsqueeze(0)
+        max_reweighted = (posterior_tensor * u).max(dim=-1)[0].item()
+        threshold = ((u - mu_tensor).unsqueeze(0) * posterior_tensor).sum(dim=-1).item() - plugin.cost
+    else:
+        # Balanced mode (BalancedLtRPlugin)
+        plugin = BalancedLtRPlugin(class_to_group, alpha, mu, cost)
+        alpha_hat = plugin._alpha_hat_class().clamp(min=eps)
+        mu_tensor = plugin._mu_class()
+        inv_alpha_hat = 1.0 / alpha_hat
+        max_reweighted = (posterior_tensor * inv_alpha_hat.unsqueeze(0)).max(dim=-1)[0].item()
+        threshold = ((inv_alpha_hat - mu_tensor).unsqueeze(0) * posterior_tensor).sum(dim=-1).item() - plugin.cost
+    
+    return max_reweighted, threshold
+
+
+# ============================================================================
 # PLUGIN CLASS (Shared by both methods)
 # ============================================================================
 
@@ -388,13 +464,52 @@ def compute_rejection_thresholds_from_test_set(
     return thresholds
 
 
+def _compute_plugin_threshold_and_max_reweighted(
+    posterior: np.ndarray,
+    plugin_params: Dict,
+    class_to_group: torch.Tensor,
+    plugin_beta: Optional[np.ndarray] = None
+) -> Tuple[float, float]:
+    """
+    Compute plugin max_reweighted and threshold for a given posterior.
+    
+    Returns:
+        (max_reweighted, threshold) tuple
+    """
+    alpha = np.array(plugin_params['alpha'])
+    mu = np.array(plugin_params['mu'])
+    cost = float(plugin_params['cost'])
+    
+    posterior_tensor = torch.tensor(posterior, dtype=torch.float32, device=class_to_group.device).unsqueeze(0)
+    eps = 1e-12
+    
+    if plugin_beta is not None:
+        # Worst mode (GeneralizedLtRPlugin)
+        plugin = GeneralizedLtRPlugin(class_to_group, alpha, mu, plugin_beta, cost)
+        u = plugin._u_class().unsqueeze(0)
+        mu_tensor = plugin._mu_class().unsqueeze(0)
+        max_reweighted = (posterior_tensor * u).max(dim=-1)[0].item()
+        threshold = ((u - mu_tensor).unsqueeze(0) * posterior_tensor).sum(dim=-1).item() - plugin.cost
+    else:
+        # Balanced mode (BalancedLtRPlugin)
+        plugin = BalancedLtRPlugin(class_to_group, alpha, mu, cost)
+        alpha_hat = plugin._alpha_hat_class().clamp(min=eps)
+        mu_tensor = plugin._mu_class()
+        inv_alpha_hat = 1.0 / alpha_hat
+        max_reweighted = (posterior_tensor * inv_alpha_hat.unsqueeze(0)).max(dim=-1)[0].item()
+        threshold = ((inv_alpha_hat - mu_tensor).unsqueeze(0) * posterior_tensor).sum(dim=-1).item() - plugin.cost
+    
+    return max_reweighted, threshold
+
+
 def plot_full_class_distribution(
     true_label: int,
     paper_result: Dict,
     our_result: Dict,
     class_names: List[str],
-    thresholds: Optional[Dict[str, float]] = None,
-    title: Optional[str] = None
+    title: Optional[str] = None,
+    use_plugin_threshold: bool = True,
+    plot_reweighted_scores: bool = True
 ) -> plt.Figure:
     """
     Plot full-class posterior distribution for single sample.
@@ -403,13 +518,13 @@ def plot_full_class_distribution(
     
     Args:
         true_label: True class label
-        paper_result: Result from paper_method_pipeline() with 'probabilities' key
-        our_result: Result from our_method_pipeline() with 'expert_probs' and 'mixture_posterior' keys
+        paper_result: Result from paper_method_pipeline() with 'probabilities' and 'plugin_params' keys
+        our_result: Result from our_method_pipeline() with 'expert_probs', 'mixture_posterior', and 'plugin_params' keys
         class_names: List of class names
-        thresholds: Optional dict with rejection thresholds for each method
-                   Format: {'ce_baseline': float, 'logitadjust_baseline': float, 
-                           'balsoftmax_baseline': float, 'gating_mixture': float}
         title: Optional custom title for the plot
+        use_plugin_threshold: If True, use plugin rejection rule (max_reweighted < threshold) for methods with plugin.
+        plot_reweighted_scores: If True, plot Plugin Reweighted Scores for CE and Gating (have plugin), 
+                               probabilities for LogitAdjust and BalSoftmax (no plugin). If False, always plot probabilities.
     
     Returns:
         matplotlib Figure object
@@ -422,6 +537,42 @@ def plot_full_class_distribution(
     la_posterior = expert_probs[1]  # LogitAdjust
     bs_posterior = expert_probs[2]  # BalSoftmax
     gating_posterior = our_result['mixture_posterior']  # [100]
+    
+    # Compute plugin thresholds and reweighted scores if use_plugin_threshold is True
+    plugin_thresholds = {}
+    plugin_max_reweighted = {}
+    reweighted_scores_dict = {}
+    if use_plugin_threshold:
+        # Get class_to_group (need to import or pass as parameter)
+        from .loaders import load_class_to_group
+        class_to_group = load_class_to_group()
+        
+        # For CE baseline (Paper Method) - uses balanced mode plugin
+        if 'plugin_params' in paper_result:
+            ce_max_rew, ce_threshold = _compute_plugin_threshold_and_max_reweighted(
+                ce_posterior, paper_result['plugin_params'], class_to_group, plugin_beta=None
+            )
+            ce_reweighted = _compute_reweighted_scores(
+                ce_posterior, paper_result['plugin_params'], class_to_group, plugin_beta=None
+            )
+            plugin_thresholds['ce_baseline'] = ce_threshold
+            plugin_max_reweighted['ce_baseline'] = ce_max_rew
+            reweighted_scores_dict['ce_baseline'] = ce_reweighted
+        
+        # For Gating mixture (Our Method)
+        if 'plugin_params' in our_result:
+            plugin_beta = our_result['plugin_params'].get('beta')
+            if isinstance(plugin_beta, list):
+                plugin_beta = np.array(plugin_beta) if plugin_beta else None
+            gating_max_rew, gating_threshold = _compute_plugin_threshold_and_max_reweighted(
+                gating_posterior, our_result['plugin_params'], class_to_group, plugin_beta=plugin_beta
+            )
+            gating_reweighted = _compute_reweighted_scores(
+                gating_posterior, our_result['plugin_params'], class_to_group, plugin_beta=plugin_beta
+            )
+            plugin_thresholds['gating_mixture'] = gating_threshold
+            plugin_max_reweighted['gating_mixture'] = gating_max_rew
+            reweighted_scores_dict['gating_mixture'] = gating_reweighted
     
     # Method colors (consistent with plot_single_sample_full_class_distribution.py)
     METHOD_COLORS = {
@@ -454,31 +605,46 @@ def plot_full_class_distribution(
     max_values = []
     text_y = 0.92
     
+    # Determine whether to plot reweighted scores or probabilities
+    should_plot_reweighted = plot_reweighted_scores and len(reweighted_scores_dict) > 0
+    
     for method_name in METHOD_ORDER:
         probs = posteriors_dict[method_name]
         color = METHOD_COLORS.get(method_name, "#999999")
         linewidth = 2.4 if method_name == "gating_mixture" else 1.8
-        alpha = 0.95 if method_name == "gating_mixture" else 0.6
+        alpha_plot = 0.95 if method_name == "gating_mixture" else 0.6
         
-        ax.plot(x, probs, linewidth=linewidth, color=color, alpha=alpha, 
-                label=DISPLAY_NAMES[method_name])
-        ax.fill_between(x, probs, alpha=0.06 if method_name == "gating_mixture" else 0.04, 
+        # Plot reweighted scores if method has plugin and plot_reweighted_scores=True
+        # Otherwise plot probabilities
+        if should_plot_reweighted and method_name in reweighted_scores_dict:
+            values_to_plot = reweighted_scores_dict[method_name]
+            plot_label = f"{DISPLAY_NAMES[method_name]} (Reweighted)"
+            # Plot plugin threshold line (in reweighted space)
+            if method_name in plugin_thresholds:
+                threshold_value = plugin_thresholds[method_name]
+                ax.axhline(threshold_value, color=color, linestyle="--", linewidth=1.5, alpha=0.9)
+        else:
+            values_to_plot = probs
+            plot_label = DISPLAY_NAMES[method_name]
+            # Methods without plugin (LA, BS) don't have threshold - just plot probabilities
+        
+        ax.plot(x, values_to_plot, linewidth=linewidth, color=color, alpha=alpha_plot, 
+                label=plot_label)
+        ax.fill_between(x, values_to_plot, alpha=0.06 if method_name == "gating_mixture" else 0.04, 
                        color=color)
-        
-        # Plot threshold if provided
-        if thresholds and method_name in thresholds:
-            threshold = thresholds[method_name]
-            ax.axhline(threshold, color=color, linestyle="--", linewidth=1.5, alpha=0.9)
         
         max_prob = float(probs.max())
         max_values.append(max_prob)
         pred = int(probs.argmax())
         is_correct = pred == true_label
         
-        # Decision text
-        if thresholds and method_name in thresholds:
-            threshold = thresholds[method_name]
-            accept = max_prob >= threshold
+        # Decision text - use plugin threshold for methods with plugin
+        if use_plugin_threshold and method_name in plugin_thresholds:
+            # Use plugin rejection rule: max_reweighted < threshold
+            max_rew = plugin_max_reweighted[method_name]
+            plugin_threshold = plugin_thresholds[method_name]
+            accept = max_rew >= plugin_threshold  # Reject if max_rew < threshold, so accept if max_rew >= threshold
+            
             if accept and is_correct:
                 decision = "True Accept (KEEP)"
                 box_color = "#2ca02c"
@@ -492,8 +658,9 @@ def plot_full_class_distribution(
                 decision = "True Reject (DROP)"
                 box_color = "#2ca02c"
             
-            threshold_text = f", τ={threshold:.2f}"
+            threshold_text = f" (max_rew={max_rew:.2f} vs threshold={plugin_threshold:.2f})"
         else:
+            # Methods without plugin: just show correctness
             decision = "[CORRECT]" if is_correct else "[WRONG]"
             box_color = "#2ca02c" if is_correct else "#d62728"
             threshold_text = ""
@@ -530,27 +697,59 @@ def plot_full_class_distribution(
     
     # Labels and title
     ax.set_xlabel("Class ID", fontsize=14, fontweight='bold')
-    ax.set_ylabel("Posterior Probability", fontsize=14, fontweight='bold')
+    if should_plot_reweighted:
+        # Mixed plot: reweighted scores and probabilities
+        if len(reweighted_scores_dict) > 0 and len(reweighted_scores_dict) < len(METHOD_ORDER):
+            ax.set_ylabel("Plugin Reweighted Score / Posterior Probability", fontsize=14, fontweight='bold')
+        elif len(reweighted_scores_dict) > 0:
+            ax.set_ylabel("Plugin Reweighted Score", fontsize=14, fontweight='bold')
+        else:
+            ax.set_ylabel("Posterior Probability", fontsize=14, fontweight='bold')
+    else:
+        ax.set_ylabel("Posterior Probability", fontsize=14, fontweight='bold')
     
     if title is None:
-        title = f"Full-Class Posterior Distribution\nTrue Class: {true_label} ({class_names[true_label]})"
+        title = f"Full-Class Distribution\nTrue Class: {true_label} ({class_names[true_label]})"
     ax.set_title(title, fontsize=16, fontweight='bold', pad=15)
     
     # Y-axis limits
-    y_max = min(1.0, max(max_values) * 1.2 + 1e-3)
+    if should_plot_reweighted:
+        # For reweighted scores, get max from reweighted values
+        reweighted_max_values = []
+        for method_name in METHOD_ORDER:
+            if method_name in reweighted_scores_dict:
+                reweighted_max_values.append(float(reweighted_scores_dict[method_name].max()))
+            else:
+                reweighted_max_values.append(max_values[METHOD_ORDER.index(method_name)])
+        y_max = max(reweighted_max_values) * 1.15 + 1e-3
+        # Also account for threshold lines
+        if plugin_thresholds:
+            max_threshold = max(plugin_thresholds.values())
+            y_max = max(y_max, max_threshold * 1.1)
+    else:
+        # For probabilities, use 0-1 scale
+        y_max = min(1.0, max(max_values) * 1.2 + 1e-3)
     ax.set_ylim(0, y_max)
     ax.set_xlim(-2, NUM_CLASSES - 1)
     ax.grid(True, linestyle="--", alpha=0.35)
     
     # Legend
     from matplotlib.lines import Line2D
-    legend_handles = [
-        Line2D([0], [0], color=METHOD_COLORS[m], linewidth=2.5, label=DISPLAY_NAMES[m]) 
-        for m in METHOD_ORDER
-    ]
-    if thresholds:
+    legend_handles = []
+    
+    # Add method lines (with updated labels from plot)
+    for method_name in METHOD_ORDER:
+        if should_plot_reweighted and method_name in reweighted_scores_dict:
+            label = f"{DISPLAY_NAMES[method_name]} (Reweighted)"
+        else:
+            label = DISPLAY_NAMES[method_name]
+        legend_handles.append(Line2D([0], [0], color=METHOD_COLORS[method_name], linewidth=2.5, label=label))
+    
+    # Add threshold legend (only for methods with plugin)
+    if should_plot_reweighted and plugin_thresholds:
         legend_handles.append(Line2D([0], [0], color="gray", linestyle="--", linewidth=1.5, 
-                                   label="Rejection threshold"))
+                                   label="Plugin rejection threshold"))
+    
     legend_handles.append(Line2D([0], [0], marker="|", color="#2ca02c", linewidth=2.5, 
                                markersize=12, label="True class"))
     ax.legend(handles=legend_handles, loc='upper right', fontsize=10, framealpha=0.9)
@@ -565,6 +764,7 @@ def plot_ce_only_full_class_distribution(
     class_names: List[str],
     threshold: Optional[float] = None,
     title: Optional[str] = None,
+    use_plugin_threshold: bool = True
 ) -> plt.Figure:
     """
     Plot full-class posterior distribution for CE + Plugin (paper method only).
@@ -574,10 +774,12 @@ def plot_ce_only_full_class_distribution(
 
     Args:
         true_label: True class label
-        paper_result: Result from paper_method_pipeline() with 'probabilities' key
+        paper_result: Result from paper_method_pipeline() with 'probabilities' and 'plugin_params' keys
         class_names: List of class names
-        threshold: Optional rejection threshold τ for CE (max-prob rule)
+        threshold: Optional rejection threshold τ for CE (max-prob rule, deprecated if use_plugin_threshold=True)
         title: Optional custom title for the plot
+        use_plugin_threshold: If True, use plugin rejection rule (max_reweighted < threshold).
+                             If False, use max_prob < threshold rule (requires threshold parameter).
 
     Returns:
         matplotlib Figure object
@@ -592,16 +794,67 @@ def plot_ce_only_full_class_distribution(
 
     fig, ax = plt.subplots(figsize=(14, 5))
 
-    ax.plot(x, ce_posterior, linewidth=2.0, color=color, alpha=0.9, label=display_name)
-    ax.fill_between(x, ce_posterior, alpha=0.06, color=color)
+    # Compute plugin threshold and reweighted scores if use_plugin_threshold is True
+    plugin_threshold = None
+    plugin_max_reweighted = None
+    reweighted_scores = None
+    plot_reweighted = False
+    
+    if use_plugin_threshold and 'plugin_params' in paper_result:
+        from .loaders import load_class_to_group
+        class_to_group = load_class_to_group()
+        
+        plugin_max_rew, ce_threshold = _compute_plugin_threshold_and_max_reweighted(
+            ce_posterior, paper_result['plugin_params'], class_to_group, plugin_beta=None
+        )
+        reweighted_scores = _compute_reweighted_scores(
+            ce_posterior, paper_result['plugin_params'], class_to_group, plugin_beta=None
+        )
+        plugin_threshold = ce_threshold
+        plugin_max_reweighted = plugin_max_rew
+        plot_reweighted = True
+    
+    # Plot reweighted scores if available, otherwise plot probabilities
+    if plot_reweighted:
+        values_to_plot = reweighted_scores
+        plot_label = f"{display_name} (Reweighted)"
+    else:
+        values_to_plot = ce_posterior
+        plot_label = display_name
+
+    ax.plot(x, values_to_plot, linewidth=2.0, color=color, alpha=0.9, label=plot_label)
+    ax.fill_between(x, values_to_plot, alpha=0.06, color=color)
 
     max_prob = float(np.max(ce_posterior))
     pred = int(np.argmax(ce_posterior))
     is_correct = pred == true_label
 
-    # Optional threshold line and decision text (Chow-style max-prob rule)
+    # Plot threshold line and decision text
     text_y = 0.9
-    if threshold is not None:
+    decision_made = False
+    
+    if use_plugin_threshold and plugin_threshold is not None:
+        # Use plugin rejection rule: max_reweighted < threshold
+        ax.axhline(plugin_threshold, color=color, linestyle="--", linewidth=1.5, alpha=0.9)
+        accept = plugin_max_reweighted >= plugin_threshold  # Reject if max_rew < threshold
+        
+        if accept and is_correct:
+            decision = "True Accept (KEEP)"
+            box_color = "#2ca02c"
+        elif accept and not is_correct:
+            decision = "FALSE ACCEPT"
+            box_color = "#d62728"
+        elif not accept and is_correct:
+            decision = "FALSE REJECT"
+            box_color = "#d62728"
+        else:
+            decision = "True Reject (DROP)"
+            box_color = "#2ca02c"
+
+        threshold_text = f" (max_rew={plugin_max_reweighted:.2f} vs τ={plugin_threshold:.2f})"
+        decision_made = True
+    elif threshold is not None:
+        # Fallback to max_prob < threshold rule
         ax.axhline(threshold, color=color, linestyle="--", linewidth=1.5, alpha=0.9)
         accept = max_prob >= threshold
         if accept and is_correct:
@@ -618,7 +871,9 @@ def plot_ce_only_full_class_distribution(
             box_color = "#2ca02c"
 
         threshold_text = f", τ={threshold:.2f}"
-    else:
+        decision_made = True
+    
+    if not decision_made:
         decision = "[CORRECT]" if is_correct else "[WRONG]"
         box_color = "#2ca02c" if is_correct else "#d62728"
         threshold_text = ""
@@ -633,12 +888,18 @@ def plot_ce_only_full_class_distribution(
     )
 
     # Mark true class
-    peak_prob = float(np.max(ce_posterior))
+    if plot_reweighted:
+        peak_value = float(np.max(reweighted_scores))
+        true_class_value = float(reweighted_scores[true_label])
+    else:
+        peak_value = float(np.max(ce_posterior))
+        true_class_value = float(ce_posterior[true_label])
+    
     ax.axvline(true_label, color="#2ca02c", linestyle="-", linewidth=2.5, alpha=0.8)
     ax.annotate(
         f"True class {true_label}",
-        xy=(true_label, min(0.95, peak_prob * 1.02 + 1e-3)),
-        xytext=(true_label + 4, min(0.98, peak_prob * 1.1 + 1e-3)),
+        xy=(true_label, min(peak_value * 1.05, true_class_value * 1.02 + 1e-3)),
+        xytext=(true_label + 4, min(peak_value * 1.1, true_class_value * 1.1 + 1e-3)),
         arrowprops=dict(arrowstyle="->", color="#2ca02c", lw=1.4),
         fontsize=10,
         color="#2ca02c",
@@ -654,14 +915,22 @@ def plot_ce_only_full_class_distribution(
 
     # Labels and title
     ax.set_xlabel("Class ID", fontsize=14, fontweight="bold")
-    ax.set_ylabel("Posterior Probability", fontsize=14, fontweight="bold")
+    if plot_reweighted:
+        ax.set_ylabel("Plugin Reweighted Score", fontsize=14, fontweight="bold")
+    else:
+        ax.set_ylabel("Posterior Probability", fontsize=14, fontweight="bold")
 
     if title is None:
-        title = f"Paper Method (CE + Plugin) – Full-Class Posterior\nTrue Class: {true_label} ({class_names[true_label]})"
+        title = f"Paper Method (CE + Plugin) – Full-Class Distribution\nTrue Class: {true_label} ({class_names[true_label]})"
     ax.set_title(title, fontsize=16, fontweight="bold", pad=15)
 
     # Y-axis limits
-    y_max = min(1.0, peak_prob * 1.2 + 1e-3)
+    if plot_reweighted:
+        y_max = peak_value * 1.15 + 1e-3
+        if plugin_threshold is not None:
+            y_max = max(y_max, plugin_threshold * 1.1)
+    else:
+        y_max = min(1.0, peak_value * 1.2 + 1e-3)
     ax.set_ylim(0, y_max)
     ax.set_xlim(-2, NUM_CLASSES - 1)
     ax.grid(True, linestyle="--", alpha=0.35)
@@ -670,9 +939,13 @@ def plot_ce_only_full_class_distribution(
     from matplotlib.lines import Line2D
 
     legend_handles = [
-        Line2D([0], [0], color=color, linewidth=2.5, label=display_name),
+        Line2D([0], [0], color=color, linewidth=2.5, label=plot_label),
     ]
-    if threshold is not None:
+    if plot_reweighted and plugin_threshold is not None:
+        legend_handles.append(
+            Line2D([0], [0], color=color, linestyle="--", linewidth=1.5, label="Plugin rejection threshold")
+        )
+    elif threshold is not None:
         legend_handles.append(
             Line2D([0], [0], color="gray", linestyle="--", linewidth=1.5, label="Rejection threshold (max-prob)")
         )

@@ -1,0 +1,10 @@
+================================================================================
+ARE_TrueAccept_CE_FalseReject - BALANCED Mode - Rejection Rate 0.80 - TAIL
+================================================================================
+
+Total cases: 2
+
+Sample     True   CE Pred    ARE Pred   CE Decision  ARE Decision  CE MaxRew    ARE MaxRew   CE Thresh    ARE Thresh  
+--------------------------------------------------------------------------------
+5547       76     76         76         reject       accept        164.6862     183.8684     185.3273     183.7718    
+8563       88     88         88         reject       accept        124.6805     158.3752     134.2802     155.9161    

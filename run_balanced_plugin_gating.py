@@ -18,7 +18,7 @@ Usage:
 Inputs (expected existing):
 - Splits dir: ./data/{dataset_name}_splits/
 - Logits dir: ./outputs/logits/{dataset_name}/{expert_name}/{split}_logits.pt
-- Gating checkpoint: ./checkpoints/gating_map/{dataset_name}/final_gating.pth
+- Gating checkpoint: ./checkpoints/gating_map/{dataset_name}/best_gating.pth
 - Targets (if available): ./outputs/logits/{dataset_name}/{expert_name}/{split}_targets.pt
 
 Outputs:
@@ -49,7 +49,7 @@ class Config:
     splits_dir: str = "./data/cifar100_lt_if100_splits_fixed"
     logits_dir: str = "./outputs/logits/cifar100_lt_if100"
     gating_checkpoint: str = (
-        "./checkpoints/gating_map/cifar100_lt_if100/final_gating.pth"
+        "./checkpoints/gating_map/cifar100_lt_if100/best_gating.pth"
     )
     results_dir: str = "./results/ltr_plugin/cifar100_lt_if100"
 
@@ -102,7 +102,7 @@ DATASET_CONFIGS = {
     "cifar100_lt_if100": {
         "splits_dir": "./data/cifar100_lt_if100_splits_fixed",
         "logits_dir": "./outputs/logits/cifar100_lt_if100",
-        "gating_checkpoint": "./checkpoints/gating_map/cifar100_lt_if100/final_gating.pth",
+        "gating_checkpoint": "./checkpoints/gating_map/cifar100_lt_if100/best_gating.pth",
         "results_dir": "./results/ltr_plugin/cifar100_lt_if100",
         "expert_names": ["ce_baseline", "logitadjust_baseline", "balsoftmax_baseline"],
         "num_classes": 100,
@@ -111,7 +111,7 @@ DATASET_CONFIGS = {
     "inaturalist2018": {
         "splits_dir": "./data/inaturalist2018_splits",
         "logits_dir": "./outputs/logits/inaturalist2018",
-        "gating_checkpoint": "./checkpoints/gating_map/inaturalist2018/final_gating.pth",
+        "gating_checkpoint": "./checkpoints/gating_map/inaturalist2018/best_gating.pth",
         "results_dir": "./results/ltr_plugin/inaturalist2018",
         "expert_names": ["ce_baseline", "logitadjust_baseline", "balsoftmax_baseline"],
         "num_classes": 8142,
@@ -120,7 +120,7 @@ DATASET_CONFIGS = {
     "imagenet_lt": {
         "splits_dir": "./data/imagenet_lt_splits",
         "logits_dir": "./outputs/logits/imagenet_lt",
-        "gating_checkpoint": "./checkpoints/gating_map/imagenet_lt/final_gating.pth",
+        "gating_checkpoint": "./checkpoints/gating_map/imagenet_lt/best_gating.pth",
         "results_dir": "./results/ltr_plugin/imagenet_lt",
         "expert_names": ["ce_baseline", "logitadjust_baseline", "balsoftmax_baseline"],
         "num_classes": 1000,

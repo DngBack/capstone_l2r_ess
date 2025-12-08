@@ -1,0 +1,10 @@
+================================================================================
+ARE_TrueAccept_CE_FalseReject - WORST Mode - Rejection Rate 0.70 - TAIL
+================================================================================
+
+Total cases: 2
+
+Sample     True   CE Pred    ARE Pred   CE Decision  ARE Decision  CE MaxRew    ARE MaxRew   CE Thresh    ARE Thresh  
+--------------------------------------------------------------------------------
+5547       76     76         76         reject       accept        77.5001      72.1634      85.9665      71.8289     
+8563       88     88         88         reject       accept        58.6737      62.1580      61.8886      60.9982     
