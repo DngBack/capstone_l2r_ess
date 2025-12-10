@@ -2,13 +2,9 @@
 ARE_TrueAccept_CE_FalseReject - WORST Mode - Rejection Rate 0.40 - TAIL
 ================================================================================
 
-Total cases: 6
+Total cases: 2
 
 Sample     True   CE Pred    ARE Pred   CE Decision  ARE Decision  CE MaxRew    ARE MaxRew   CE Thresh    ARE Thresh  
 --------------------------------------------------------------------------------
-328        94     94         94         reject       accept        19.5583      24.5967      23.6506      21.3879     
-1901       88     88         88         reject       accept        25.1644      25.4111      27.1340      20.3467     
-2432       94     94         94         reject       accept        27.9723      28.0040      29.9178      23.3322     
-3228       69     69         69         reject       accept        20.4725      18.7462      22.5051      18.4109     
-6598       76     76         76         reject       accept        38.8064      32.6483      39.3339      26.0632     
-6815       77     77         77         reject       accept        35.5759      21.4446      37.3390      21.2533     
+5547       76     76         76         reject       accept        83.1221      105.6390     90.9937      105.4937    
+8563       88     88         88         reject       accept        62.9300      90.9922      66.3453      89.6319     

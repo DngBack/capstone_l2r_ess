@@ -259,16 +259,20 @@ def evaluate_with_pipelines(
     ce_expert: Expert,
     all_experts: List[Expert],
     gating_network: GatingNetwork,
-    mode: str
+    mode: str,
+    rejection_rate: float = 0.4
 ) -> List[RejectionCase]:
     """
     Evaluate using the exact notebook pipelines (paper_method_pipeline & our_method_pipeline).
     This runs per-sample for full fidelity.
+    
+    Args:
+        rejection_rate: Target rejection rate for plugin parameters
     """
-    print(f"\n   Evaluating mode={mode} with notebook pipelines (sequential)...")
-    # Load plugin params as notebook does
-    ce_alpha, ce_mu, ce_cost = load_plugin_params(method="ce_only", mode=mode)
-    moe_alpha, moe_mu, moe_cost = load_plugin_params(method="moe", mode=mode)
+    print(f"\n   Evaluating mode={mode}, rejection_rate={rejection_rate} with notebook pipelines (sequential)...")
+    # Load plugin params as notebook does, with specified rejection_rate
+    ce_alpha, ce_mu, ce_cost = load_plugin_params(method="ce_only", mode=mode, rejection_rate=rejection_rate)
+    moe_alpha, moe_mu, moe_cost = load_plugin_params(method="moe", mode=mode, rejection_rate=rejection_rate)
     
     better_cases = []
     class_to_group_np = class_to_group.cpu().numpy()
@@ -342,7 +346,7 @@ def evaluate_with_pipelines(
                 are_max_reweighted=are_max_rew,
                 ce_threshold=ce_threshold,
                 are_threshold=are_threshold,
-                rejection_rate=0.3,  # notebook pipeline selects ~0.3
+                rejection_rate=rejection_rate,  # Use the rejection_rate parameter
                 mode=mode,
                 group=group_str,
                 case_type=case_type,
@@ -643,7 +647,7 @@ def main():
     print("=" * 80)
     print("ARE vs CE Rejection Decision Comparison")
     print("=" * 80)
-    RR_TARGET_SAVE = 0.3  # rejection rate to save images for
+    RR_TARGET_SAVE = 0.4  # rejection rate to save images for
     USE_PIPELINE_EVAL = True  # run per-sample with notebook pipelines
     
     # Load models

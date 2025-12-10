@@ -531,11 +531,8 @@ def plot_full_class_distribution(
     """
     x = np.arange(NUM_CLASSES)
     
-    # Extract posteriors
+    # Extract posteriors - only CE and ARE (Gating)
     ce_posterior = paper_result['probabilities']  # [100]
-    expert_probs = our_result['expert_probs']  # [3, 100]
-    la_posterior = expert_probs[1]  # LogitAdjust
-    bs_posterior = expert_probs[2]  # BalSoftmax
     gating_posterior = our_result['mixture_posterior']  # [100]
     
     # Compute plugin thresholds and reweighted scores if use_plugin_threshold is True
@@ -592,15 +589,13 @@ def plot_full_class_distribution(
     # Create figure
     fig, ax = plt.subplots(figsize=(14, 7))
     
-    # Plot posteriors
+    # Plot posteriors - only CE and ARE (Gating)
     posteriors_dict = {
         'ce_baseline': ce_posterior,
-        'logitadjust_baseline': la_posterior,
-        'balsoftmax_baseline': bs_posterior,
         'gating_mixture': gating_posterior,
     }
     
-    METHOD_ORDER = ["ce_baseline", "logitadjust_baseline", "balsoftmax_baseline", "gating_mixture"]
+    METHOD_ORDER = ["ce_baseline", "gating_mixture"]
     
     max_values = []
     text_y = 0.92

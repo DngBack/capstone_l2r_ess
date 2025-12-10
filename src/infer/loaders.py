@@ -319,13 +319,14 @@ def load_gating_network():
     return result
 
 
-def load_plugin_params(method: str = "moe", mode: str = "worst") -> Tuple[np.ndarray, np.ndarray, float]:
+def load_plugin_params(method: str = "moe", mode: str = "worst", rejection_rate: Optional[float] = None) -> Tuple[np.ndarray, np.ndarray, float]:
     """
     Load optimized plugin parameters from results JSON files.
     
     Args:
         method: Either "moe" (Mixture of Experts with gating) or "ce_only" (CE expert only)
         mode: Either "balanced" or "worst"
+        rejection_rate: Target rejection rate (e.g., 0.3). If None, finds closest to 0.3.
     
     Returns:
         Tuple of (alpha, mu, cost) as numpy arrays and float
@@ -371,16 +372,16 @@ def load_plugin_params(method: str = "moe", mode: str = "worst") -> Tuple[np.nda
     if len(results_list) == 0:
         raise ValueError(f"No results found in {results_path} under key '{results_key}'")
     
-    # Find config with rejection rate closest to 0.3
+    # Find config with target rejection rate
+    target_rejection_rate = rejection_rate if rejection_rate is not None else 0.3
     best_result = None
-    best_diff = float('inf')
     
+    # First, try to find exact match with target_rejection field
     for r in results_list:
-        rej_rate = 1.0 - r[metrics_key]["coverage"]
-        diff = abs(rej_rate - 0.3)
-        if diff < best_diff:
-            best_diff = diff
-            best_result = r
+        if "target_rejection" in r:
+            if abs(r["target_rejection"] - target_rejection_rate) < 1e-6:
+                best_result = r
+                break
     
     if best_result is None:
         best_result = results_list[0]
@@ -391,12 +392,17 @@ def load_plugin_params(method: str = "moe", mode: str = "worst") -> Tuple[np.nda
     # Extract cost based on method and mode
     if method == "moe" and mode == "worst":
         cost = best_result.get("cost_test", 0.0)
+        beta = np.array(best_result.get("beta", [1.0, 1.0])) if "beta" in best_result else None
     elif method == "ce_only" and mode == "balanced":
         cost = best_result.get("cost_val", best_result.get("cost_test", 0.0))
+        beta = None
     else:
         cost = best_result.get("cost_test", best_result.get("cost_val", 0.0))
+        beta = np.array(best_result.get("beta", [1.0, 1.0])) if "beta" in best_result else None
     
     print(f"✅ Loaded plugin params ({method}, {mode}) from {results_path}")
     print(f"   α = {alpha}, μ = {mu}")
+    if beta is not None:
+        print(f"   β = {beta}")
     
     return alpha, mu, cost
